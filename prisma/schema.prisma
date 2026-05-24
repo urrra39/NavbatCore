@@ -1,0 +1,431 @@
+// =============================================================================
+// NavbatCore — Multi-Tenant Queue Infrastructure
+// -----------------------------------------------------------------------------
+// Topology
+//   * Shared-database / shared-schema multi-tenancy. Every tenant-owned row
+//     carries a `clinicId` discriminator and every unique constraint is scoped
+//     to that discriminator. The schema is enforced by Postgres FKs *and* by
+//     Zod validators at the application boundary (see src/schemas/*.ts).
+//
+//   * Two physical tables back the ticket lifecycle:
+//       - HotTicket          : active, low-latency, narrow indexes, kept slim.
+//       - ColdTicketArchive  : write-mostly, encrypted + gzip-compressed
+//                              snapshot of completed/canceled/no-show tickets
+//                              older than `Clinic.retentionDays` (default 7).
+//
+//   * All temporal columns use `timestamptz(6)` — microsecond precision is
+//     required for the EMA ETA estimator and for the millisecond countdown
+//     surface rendered by the Liquid Glass UI.
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearchPostgres", "metrics"]
+}
+
+datasource db {
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  directUrl         = env("DIRECT_DATABASE_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------------------
+
+enum ClinicPlan {
+  FREE
+  STANDARD
+  PRO
+  ENTERPRISE
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  RECEPTIONIST
+  PROVIDER
+  PATIENT
+}
+
+enum TicketStatus {
+  PENDING       // Created, awaiting confirmation / payment.
+  CONFIRMED     // Locked into the queue.
+  CHECKED_IN    // Patient physically present.
+  IN_PROGRESS   // Currently being served.
+  COMPLETED     // Successfully served — eligible for archival.
+  CANCELED      // Canceled by patient or staff — eligible for archival.
+  NO_SHOW       // Slot expired without check-in — eligible for archival.
+}
+
+enum TicketChannel {
+  WEB
+  MOBILE_APP
+  WALK_IN
+  PHONE
+  PARTNER_API
+}
+
+enum AuditAction {
+  TICKET_CREATED
+  TICKET_STATE_TRANSITION
+  TICKET_RESCHEDULED
+  TICKET_ARCHIVED
+  TICKET_PURGED
+  CLINIC_SETTINGS_UPDATED
+  USER_INVITED
+  USER_REVOKED
+}
+
+enum ArchiveCipher {
+  AES_256_GCM
+}
+
+enum ArchiveCompression {
+  GZIP
+  BROTLI
+  NONE
+}
+
+// -----------------------------------------------------------------------------
+// Tenant root: Clinic
+// -----------------------------------------------------------------------------
+
+model Clinic {
+  id              String     @id @default(cuid())
+  /// Public, SEO-stable handle used for SSR routes like /c/{slug}.
+  slug            String     @unique
+  legalName       String
+  displayName     String
+  plan            ClinicPlan @default(STANDARD)
+
+  // Contact / locale
+  city            String?
+  countryCode     String     @default("UZ") @db.VarChar(2)
+  timezone        String     @default("Asia/Tashkent")
+  phone           String?
+  email           String?
+
+  // SEO surface (consumed by Next.js generateMetadata in /c/[slug]).
+  metaTitle       String?
+  metaDescription String?    @db.Text
+  ogImageUrl      String?
+  keywords        String[]   @default([])
+
+  // Admin-tunable runtime settings. Validated on write via ClinicSettingsSchema.
+  // Shape (see src/schemas/clinic.ts):
+  //   { slotDurationSec, openingHours[], maxQueueDepth, allowOverbook,
+  //     graceWindowSec, emaAlpha, autoCheckInRadiusMeters, ... }
+  settings        Json       @default("{}") @db.JsonB
+
+  // Liquid Glass theme tokens (palette, blur radius, gradient stops).
+  theme           Json       @default("{}") @db.JsonB
+
+  // Retention policy override. The retention worker uses
+  // `min(globalDefault, this)` so tenants can shorten — never extend — defaults.
+  retentionDays   Int        @default(7)
+
+  isActive        Boolean    @default(true)
+  verifiedAt      DateTime?  @db.Timestamptz(6)
+
+  createdAt       DateTime   @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime   @updatedAt @db.Timestamptz(6)
+
+  users           User[]
+  services        Service[]
+  providers       Provider[]
+  hotTickets      HotTicket[]
+  archives        ColdTicketArchive[]
+  auditLogs       AuditLog[]
+  retentionRuns   RetentionRun[]
+
+  @@index([slug])
+  @@index([isActive, plan])
+  @@index([countryCode, city])
+  @@map("clinics")
+}
+
+// -----------------------------------------------------------------------------
+// User
+// -----------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  clinicId      String?
+  clinic        Clinic?   @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  // Patients are not bound to a clinic; staff/admins are.
+  role          UserRole  @default(PATIENT)
+  email         String?
+  phoneE164     String?
+  fullName      String
+  passwordHash  String?
+  locale        String    @default("uz")
+
+  isActive      Boolean   @default(true)
+  lastSeenAt    DateTime? @db.Timestamptz(6)
+
+  createdAt     DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(6)
+
+  hotTickets    HotTicket[] @relation("PatientTickets")
+
+  // A given email/phone is unique per clinic (staff) OR globally (patients,
+  // clinicId NULL). The partial-unique semantics are enforced by raw SQL in
+  // the migration; the composite indexes here cover the lookups.
+  @@index([clinicId, email])
+  @@index([clinicId, phoneE164])
+  @@index([phoneE164])
+  @@index([email])
+  @@map("users")
+}
+
+// -----------------------------------------------------------------------------
+// Service & Provider
+// -----------------------------------------------------------------------------
+
+model Service {
+  id              String    @id @default(cuid())
+  clinicId        String
+  clinic          Clinic    @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  code            String
+  name            String
+  description     String?   @db.Text
+  /// Estimated duration in seconds. Used by the EMA ETA model as a prior.
+  durationSec     Int       @default(900)
+  priceMinor      Int       @default(0)
+  currency        String    @default("UZS") @db.VarChar(3)
+  isActive        Boolean   @default(true)
+
+  createdAt       DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
+
+  hotTickets      HotTicket[]
+
+  @@unique([clinicId, code])
+  @@index([clinicId, isActive])
+  @@map("services")
+}
+
+model Provider {
+  id              String    @id @default(cuid())
+  clinicId        String
+  clinic          Clinic    @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  fullName        String
+  specialty       String?
+  bio             String?   @db.Text
+  avatarUrl       String?
+  isActive        Boolean   @default(true)
+
+  createdAt       DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
+
+  hotTickets      HotTicket[]
+
+  @@index([clinicId, isActive])
+  @@map("providers")
+}
+
+// -----------------------------------------------------------------------------
+// HotTicket — the live, hot-path queue row.
+// -----------------------------------------------------------------------------
+//
+// Optimistic locking: every state transition increments `version`. The
+// application performs `UPDATE ... WHERE id = $1 AND version = $expected`
+// to prevent double-booking races between WS clients.
+//
+// Indexing strategy:
+//   * (clinicId, status, scheduledFor) — primary queue scan for the live UI.
+//   * (clinicId, ticketCode)           — public lookup by short code.
+//   * (clinicId, status, completedAt)  — feeds the retention worker.
+//   * (patientId, status)              — patient dashboard.
+// -----------------------------------------------------------------------------
+
+model HotTicket {
+  id               String        @id @default(cuid())
+
+  clinicId         String
+  clinic           Clinic        @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  serviceId        String
+  service          Service       @relation(fields: [serviceId], references: [id])
+
+  providerId       String?
+  provider         Provider?     @relation(fields: [providerId], references: [id])
+
+  patientId        String?
+  patient          User?         @relation("PatientTickets", fields: [patientId], references: [id])
+
+  // Public, human-friendly short code (e.g. "A-074"). Unique per clinic.
+  ticketCode       String
+
+  status           TicketStatus  @default(PENDING)
+  channel          TicketChannel @default(WEB)
+  priority         Int           @default(0)
+
+  // Deterministic ordering when scheduledFor ties. Uses a 1-based integer
+  // counter scoped per (clinicId, scheduledFor::date).
+  positionInDay    Int           @default(0)
+
+  // -- Microsecond-precise lifecycle stamps --------------------------------
+  scheduledFor     DateTime      @db.Timestamptz(6)
+  enqueuedAt       DateTime      @default(now()) @db.Timestamptz(6)
+  confirmedAt      DateTime?     @db.Timestamptz(6)
+  checkedInAt      DateTime?     @db.Timestamptz(6)
+  startedAt        DateTime?     @db.Timestamptz(6)
+  completedAt      DateTime?     @db.Timestamptz(6)
+  canceledAt       DateTime?     @db.Timestamptz(6)
+  cancelReason     String?
+
+  // Computed by the EMA estimator on every queue mutation.
+  etaAt            DateTime?     @db.Timestamptz(6)
+  etaConfidence    Float?
+
+  // Free-form, validated by Zod (TicketMetadataSchema): symptoms, referral,
+  // payment intent, locale, etc. Never trust raw — always parse.
+  metadata         Json          @default("{}") @db.JsonB
+
+  // Optimistic concurrency control.
+  version          Int           @default(0)
+
+  createdAt        DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime      @updatedAt @db.Timestamptz(6)
+
+  @@unique([clinicId, ticketCode])
+  @@index([clinicId, status, scheduledFor])
+  @@index([clinicId, status, completedAt])
+  @@index([clinicId, providerId, scheduledFor])
+  @@index([patientId, status])
+  @@index([etaAt])
+  @@map("hot_tickets")
+}
+
+// -----------------------------------------------------------------------------
+// ColdTicketArchive — encrypted, compressed, write-once.
+// -----------------------------------------------------------------------------
+//
+// The retention worker (src/workers/retention.worker.ts) copies eligible
+// HotTicket rows here once `completedAt < now() - retentionDays`. The full
+// canonical JSON (including AuditLog tail) is stored in `payloadCipher`,
+// encrypted with AES-256-GCM and compressed with gzip. A small searchable
+// header (clinicId, ticketCode, status, completedAt, scheduledFor) is kept
+// in clear so analytics and patient receipt lookups don't need to decrypt.
+// -----------------------------------------------------------------------------
+
+model ColdTicketArchive {
+  id               String             @id @default(cuid())
+
+  clinicId         String
+  clinic           Clinic             @relation(fields: [clinicId], references: [id], onDelete: Restrict)
+
+  /// The original HotTicket.id at archival time, kept for cross-references.
+  originalTicketId String             @unique
+
+  // -- Searchable header (clear) -------------------------------------------
+  ticketCode       String
+  status           TicketStatus
+  serviceCode      String?
+  providerName     String?
+  scheduledFor     DateTime           @db.Timestamptz(6)
+  completedAt      DateTime?          @db.Timestamptz(6)
+  canceledAt       DateTime?          @db.Timestamptz(6)
+  channel          TicketChannel
+  durationSec      Int?
+
+  // -- Encrypted compressed payload ----------------------------------------
+  /// Raw cipher bytes: ciphertext only (auth tag is separate).
+  payloadCipher    Bytes
+  /// 12-byte IV / nonce used by AES-GCM.
+  payloadIv        Bytes
+  /// 16-byte GCM authentication tag.
+  payloadAuthTag   Bytes
+  /// Additional Authenticated Data — clinicId|ticketCode|keyId — binds the
+  /// ciphertext to its tenant. Tampering across tenants will fail decryption.
+  payloadAad       Bytes
+  cipher           ArchiveCipher      @default(AES_256_GCM)
+  compression      ArchiveCompression @default(GZIP)
+
+  /// Logical key identifier (e.g. "ark-2026-05") for envelope-style rotation.
+  keyId            String
+  /// Bytes after JSON.stringify, before compression.
+  rawSize          Int
+  /// Bytes after compression, before encryption.
+  compressedSize   Int
+
+  archivedAt       DateTime           @default(now()) @db.Timestamptz(6)
+  /// Worker-run identifier — links rows back to a RetentionRun batch.
+  retentionRunId   String?
+  retentionRun     RetentionRun?      @relation(fields: [retentionRunId], references: [id])
+
+  @@index([clinicId, archivedAt])
+  @@index([clinicId, ticketCode])
+  @@index([clinicId, status, completedAt])
+  @@index([retentionRunId])
+  @@map("cold_ticket_archive")
+}
+
+// -----------------------------------------------------------------------------
+// RetentionRun — one row per cron tick, used for observability and locking.
+// -----------------------------------------------------------------------------
+
+model RetentionRun {
+  id              String    @id @default(cuid())
+
+  clinicId        String?
+  clinic          Clinic?   @relation(fields: [clinicId], references: [id], onDelete: SetNull)
+
+  startedAt       DateTime  @default(now()) @db.Timestamptz(6)
+  finishedAt      DateTime? @db.Timestamptz(6)
+
+  cutoff          DateTime  @db.Timestamptz(6)
+  scanned         Int       @default(0)
+  archived        Int       @default(0)
+  purged          Int       @default(0)
+  failed          Int       @default(0)
+  bytesRaw        BigInt    @default(0)
+  bytesCompressed BigInt    @default(0)
+
+  /// Worker hostname / pod id — identifies which replica took the lock.
+  workerId        String?
+  /// Last error message if the run aborted.
+  lastError       String?   @db.Text
+
+  archives        ColdTicketArchive[]
+
+  @@index([clinicId, startedAt])
+  @@index([startedAt])
+  @@map("retention_runs")
+}
+
+// -----------------------------------------------------------------------------
+// AuditLog — every state transition or settings change.
+// -----------------------------------------------------------------------------
+
+model AuditLog {
+  id          String      @id @default(cuid())
+
+  clinicId    String
+  clinic      Clinic      @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  actorId     String?
+  action      AuditAction
+  /// Polymorphic target ("HotTicket", "ColdTicketArchive", "Clinic", ...).
+  targetType  String
+  targetId    String
+
+  /// Rich diff payload validated by AuditPayloadSchema.
+  payload     Json        @default("{}") @db.JsonB
+
+  ip          String?     @db.Inet
+  userAgent   String?
+
+  createdAt   DateTime    @default(now()) @db.Timestamptz(6)
+
+  @@index([clinicId, createdAt])
+  @@index([clinicId, targetType, targetId])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
