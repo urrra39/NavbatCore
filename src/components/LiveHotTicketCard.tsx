@@ -20,7 +20,6 @@
  * then takes over via WebSockets for live updates.
  */
 
-import { TicketStatus } from "@prisma/client";
 import {
   AnimatePresence,
   LayoutGroup,
@@ -37,6 +36,7 @@ import {
 } from "@/hooks/useHotTicketSocket";
 import { useMillisecondCountdown } from "@/hooks/useMillisecondCountdown";
 import { cn } from "@/lib/cn";
+import { TicketStatus } from "@/schemas/ticket";
 
 // ----------------------------------------------------------------------------
 // Public props

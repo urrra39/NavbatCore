@@ -9,8 +9,40 @@
  * appear in `ALLOWED_TRANSITIONS` are accepted; everything else throws.
  */
 
-import { TicketChannel, TicketStatus } from "@prisma/client";
 import { z } from "zod";
+
+// -----------------------------------------------------------------------------
+// Domain enums (runtime values + types).
+// -----------------------------------------------------------------------------
+//
+// We mirror the Prisma-generated `TicketStatus` / `TicketChannel` enums here
+// instead of importing them from `@prisma/client` so that the UI layer never
+// depends on `prisma generate` having run. The string values are identical
+// to the database enum, so anything that flows through the API boundary
+// (raw SQL, Prisma queries, JSON payloads) is interchangeable.
+//
+// Single source of truth: anything client-side that needs the enum values
+// imports from this file.
+
+export const TicketStatus = {
+  PENDING: "PENDING",
+  CONFIRMED: "CONFIRMED",
+  CHECKED_IN: "CHECKED_IN",
+  IN_PROGRESS: "IN_PROGRESS",
+  COMPLETED: "COMPLETED",
+  CANCELED: "CANCELED",
+  NO_SHOW: "NO_SHOW",
+} as const;
+export type TicketStatus = (typeof TicketStatus)[keyof typeof TicketStatus];
+
+export const TicketChannel = {
+  WEB: "WEB",
+  MOBILE_APP: "MOBILE_APP",
+  WALK_IN: "WALK_IN",
+  PHONE: "PHONE",
+  PARTNER_API: "PARTNER_API",
+} as const;
+export type TicketChannel = (typeof TicketChannel)[keyof typeof TicketChannel];
 
 // -----------------------------------------------------------------------------
 // Primitive helpers

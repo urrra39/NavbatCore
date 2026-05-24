@@ -18,11 +18,10 @@
  * for both.
  */
 
-import { TicketStatus } from "@prisma/client";
-
 import { LiveHotTicketCard } from "@/components/LiveHotTicketCard";
 import { LiquidGlassSurface } from "@/components/glass/LiquidGlassSurface";
 import type { LiveTicketSnapshot } from "@/hooks/useHotTicketSocket";
+import { TicketStatus } from "@/schemas/ticket";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
