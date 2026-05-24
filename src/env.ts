@@ -50,9 +50,20 @@ const EnvSchema = z.object({
 
   RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(7),
   /** Standard 5-field cron expression. node-cron validates this. */
-  RETENTION_CRON: z.string().min(1).default("*/10 * * * *"),
+  RETENTION_CRON: z.string().min(1).default("0 3 * * *"),
   RETENTION_BATCH_SIZE: z.coerce.number().int().min(1).max(10_000).default(500),
   RETENTION_RUN_ONCE: booleanish.default("0"),
+
+  AUDIT_HMAC_SECRET: z
+    .string()
+    .min(32, "AUDIT_HMAC_SECRET must be at least 32 chars")
+    .default(
+      "dev-only-audit-hmac-secret-replace-me-in-production-please-32",
+    ),
+  HIS_GATEWAY_HMAC_SECRET: z
+    .string()
+    .min(16)
+    .default("dev-only-his-shared-secret-16chr"),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

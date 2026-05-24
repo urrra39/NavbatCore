@@ -1,39 +1,38 @@
 /**
  * Zod schemas + finite state machine for HotTicket lifecycle.
  *
- * These schemas are the SINGLE source of truth for incoming payloads. Every
- * API route, WebSocket handler, and worker import from here — never trust
- * a Prisma row that originated outside the database without parsing it.
+ * Single source of truth for the queue lifecycle vocabulary. The
+ * Prisma `TicketStatus` enum, the realtime event payloads, the worker,
+ * and every UI component import from this file (or from `lib/triage.ts`,
+ * which re-exports the enum + Uzbek labels).
  *
- * The state machine is deliberately conservative: only transitions that
- * appear in `ALLOWED_TRANSITIONS` are accepted; everything else throws.
+ * The state machine in `ALLOWED_TRANSITIONS` is consulted by every
+ * ticket mutation — anything not enumerated there is rejected.
  */
 
 import { z } from "zod";
 
 // -----------------------------------------------------------------------------
-// Domain enums (runtime values + types).
+// Domain enums (string-literal const objects so the UI bundle never depends
+// on `prisma generate` having run).
 // -----------------------------------------------------------------------------
-//
-// We mirror the Prisma-generated `TicketStatus` / `TicketChannel` enums here
-// instead of importing them from `@prisma/client` so that the UI layer never
-// depends on `prisma generate` having run. The string values are identical
-// to the database enum, so anything that flows through the API boundary
-// (raw SQL, Prisma queries, JSON payloads) is interchangeable.
-//
-// Single source of truth: anything client-side that needs the enum values
-// imports from this file.
 
 export const TicketStatus = {
-  PENDING: "PENDING",
-  CONFIRMED: "CONFIRMED",
-  CHECKED_IN: "CHECKED_IN",
-  IN_PROGRESS: "IN_PROGRESS",
-  COMPLETED: "COMPLETED",
-  CANCELED: "CANCELED",
-  NO_SHOW: "NO_SHOW",
+  KUTMOQDA: "KUTMOQDA",
+  TASDIQLANGAN: "TASDIQLANGAN",
+  QABULDA: "QABULDA",
+  TUGATILDI: "TUGATILDI",
+  BEKOR_QILINGAN: "BEKOR_QILINGAN",
+  KELMADI: "KELMADI",
 } as const;
 export type TicketStatus = (typeof TicketStatus)[keyof typeof TicketStatus];
+
+export const Severity = {
+  YENGIL: "YENGIL",
+  ORTA: "ORTA",
+  OGIR: "OGIR",
+} as const;
+export type Severity = (typeof Severity)[keyof typeof Severity];
 
 export const TicketChannel = {
   WEB: "WEB",
@@ -45,10 +44,9 @@ export const TicketChannel = {
 export type TicketChannel = (typeof TicketChannel)[keyof typeof TicketChannel];
 
 // -----------------------------------------------------------------------------
-// Primitive helpers
+// Primitive schemas
 // -----------------------------------------------------------------------------
 
-/** Microsecond-precision ISO 8601 instant. Accepts strings or Date. */
 export const PreciseDateSchema = z
   .union([z.string().datetime({ offset: true, precision: 6 }), z.date()])
   .transform((v) => (v instanceof Date ? v : new Date(v)));
@@ -64,10 +62,11 @@ export const TicketCodeSchema = z
   .regex(/^[A-Z0-9-]+$/, "ticket_code_must_be_uppercase_alnum_hyphen");
 
 export const TicketStatusSchema = z.nativeEnum(TicketStatus);
+export const SeveritySchema = z.nativeEnum(Severity);
 export const TicketChannelSchema = z.nativeEnum(TicketChannel);
 
 // -----------------------------------------------------------------------------
-// Metadata — open struct, but with a known core.
+// Ticket metadata — open struct with a known core
 // -----------------------------------------------------------------------------
 
 export const TicketMetadataSchema = z
@@ -83,6 +82,8 @@ export const TicketMetadataSchema = z
       })
       .optional(),
     contactPreference: z.enum(["sms", "push", "voice", "none"]).default("sms"),
+    /** True if inserted via the receptionist's emergency buffer. */
+    emergency: z.boolean().default(false),
   })
   .passthrough();
 
@@ -94,10 +95,12 @@ export type TicketMetadata = z.infer<typeof TicketMetadataSchema>;
 
 export const CreateTicketInputSchema = z.object({
   clinicId: ClinicIdSchema,
-  serviceId: CuidSchema,
-  providerId: CuidSchema.optional(),
+  departmentId: CuidSchema,
+  doctorId: CuidSchema.optional(),
   patientId: CuidSchema.optional(),
 
+  /** Patient-supplied severity tier — drives the triage matrix. */
+  severity: SeveritySchema,
   scheduledFor: PreciseDateSchema,
   channel: TicketChannelSchema.default(TicketChannel.WEB),
   priority: z.number().int().min(0).max(100).default(0),
@@ -110,33 +113,25 @@ export type CreateTicketInput = z.infer<typeof CreateTicketInputSchema>;
 // State transitions
 // -----------------------------------------------------------------------------
 
-/**
- * Allowed transitions for the queue state machine.
- * Any pair NOT listed here is rejected by `assertTransition`.
- */
 export const ALLOWED_TRANSITIONS: Readonly<
   Record<TicketStatus, ReadonlyArray<TicketStatus>>
 > = Object.freeze({
-  [TicketStatus.PENDING]: [
-    TicketStatus.CONFIRMED,
-    TicketStatus.CANCELED,
+  [TicketStatus.KUTMOQDA]: [
+    TicketStatus.TASDIQLANGAN,
+    TicketStatus.BEKOR_QILINGAN,
   ],
-  [TicketStatus.CONFIRMED]: [
-    TicketStatus.CHECKED_IN,
-    TicketStatus.CANCELED,
-    TicketStatus.NO_SHOW,
+  [TicketStatus.TASDIQLANGAN]: [
+    TicketStatus.QABULDA,
+    TicketStatus.BEKOR_QILINGAN,
+    TicketStatus.KELMADI,
   ],
-  [TicketStatus.CHECKED_IN]: [
-    TicketStatus.IN_PROGRESS,
-    TicketStatus.CANCELED,
+  [TicketStatus.QABULDA]: [
+    TicketStatus.TUGATILDI,
+    TicketStatus.BEKOR_QILINGAN,
   ],
-  [TicketStatus.IN_PROGRESS]: [
-    TicketStatus.COMPLETED,
-    TicketStatus.CANCELED,
-  ],
-  [TicketStatus.COMPLETED]: [],
-  [TicketStatus.CANCELED]: [],
-  [TicketStatus.NO_SHOW]: [],
+  [TicketStatus.TUGATILDI]: [],
+  [TicketStatus.BEKOR_QILINGAN]: [],
+  [TicketStatus.KELMADI]: [],
 });
 
 export class InvalidTransitionError extends Error {
@@ -146,20 +141,17 @@ export class InvalidTransitionError extends Error {
   }
 }
 
-export const assertTransition = (
-  from: TicketStatus,
-  to: TicketStatus,
-): void => {
+export const assertTransition = (from: TicketStatus, to: TicketStatus): void => {
   if (!ALLOWED_TRANSITIONS[from].includes(to)) {
     throw new InvalidTransitionError(from, to);
   }
 };
 
-/** Statuses that are eligible for archival once they age past retentionDays. */
+/** Statuses that age into the 7-day cold archive. */
 export const ARCHIVABLE_STATUSES: ReadonlyArray<TicketStatus> = [
-  TicketStatus.COMPLETED,
-  TicketStatus.CANCELED,
-  TicketStatus.NO_SHOW,
+  TicketStatus.TUGATILDI,
+  TicketStatus.BEKOR_QILINGAN,
+  TicketStatus.KELMADI,
 ];
 
 export const TransitionInputSchema = z
@@ -181,7 +173,7 @@ export const TransitionInputSchema = z
         message: `invalid_transition:${val.from}->${val.to}`,
       });
     }
-    if (val.to === TicketStatus.CANCELED && !val.reason) {
+    if (val.to === TicketStatus.BEKOR_QILINGAN && !val.reason) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["reason"],
@@ -193,7 +185,7 @@ export const TransitionInputSchema = z
 export type TransitionInput = z.infer<typeof TransitionInputSchema>;
 
 // -----------------------------------------------------------------------------
-// Realtime event payloads (pushed through Redis Pub/Sub -> WebSockets).
+// Realtime event payloads (Redis Pub/Sub -> WebSocket)
 // -----------------------------------------------------------------------------
 
 export const RealtimeTicketEventSchema = z.discriminatedUnion("type", [
@@ -203,6 +195,7 @@ export const RealtimeTicketEventSchema = z.discriminatedUnion("type", [
     clinicId: ClinicIdSchema,
     ticketCode: TicketCodeSchema,
     status: TicketStatusSchema,
+    severity: SeveritySchema,
     scheduledFor: PreciseDateSchema,
     etaAt: PreciseDateSchema.nullable(),
     positionInDay: z.number().int().min(0),
@@ -231,6 +224,16 @@ export const RealtimeTicketEventSchema = z.discriminatedUnion("type", [
     originalTicketId: CuidSchema,
     clinicId: ClinicIdSchema,
     ticketCode: TicketCodeSchema,
+    occurredAt: PreciseDateSchema,
+  }),
+  z.object({
+    type: z.literal("queue.recalculated"),
+    clinicId: ClinicIdSchema,
+    departmentId: CuidSchema,
+    /** Reason — typically "emergency_buffer_inserted". */
+    cause: z.string().max(64),
+    /** Number of tickets whose ETA changed. */
+    affected: z.number().int().min(0),
     occurredAt: PreciseDateSchema,
   }),
 ]);

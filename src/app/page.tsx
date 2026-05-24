@@ -1,316 +1,97 @@
 /**
- * Akfa Medline · Bosh navbat boshqaruv paneli (Dashboard).
+ * Public clinic search portal — `/`.
  *
- * Server Component. Responsibilities:
- *   1. Capture a single request-time anchor (`now`).
- *   2. Build the mock ticket dataset from a stable seed table and pre-format
- *      every clock-derived field into a string with the `Asia/Tashkent` Intl
- *      formatter — this guarantees SSR and CSR produce identical text.
- *   3. Hand the (already-serializable) dataset down to <DashboardShell/>,
- *      which is the only client component on the page and which owns the
- *      department-tab state.
+ * Server Component. Fully SSR for Google indexability:
+ *   * Page is `force-dynamic` so the rendered HTML always reflects the
+ *     current filter and live queue depth (no stale ISR snapshots).
+ *   * Every clinic card is rendered as a real `<a>` link on the server,
+ *     which is what crawlers consume.
+ *   * The `ClinicSearchForm` is the only client component; submitting it
+ *     pushes new query params and forces a fresh server render.
  *
- * Hydration policy:
- *   * No client-side `Date.now()` or `new Date()` runs during the initial
- *     render. The only ticking value (Sarflangan vaqt) is seeded from a
- *     server-computed `initialElapsedSec` and starts ticking strictly
- *     inside `useEffect` — see ElapsedTime.tsx.
- *   * `dynamic = "force-dynamic"` keeps the cache disabled so every visit
- *     gets a fresh anchor and the elapsed counters look "live" on first
- *     load instead of frozen at build time.
+ * Search params honored:
+ *   q     — free-text match against name / city / address
+ *   city  — exact city name
+ *   dep   — department code (KARDIOLOGIYA / STOMATOLOGIYA / LOR / NEVROLOGIYA)
  */
 
-import { DashboardShell } from "@/components/dashboard/DashboardShell";
+import type { Metadata } from "next";
+import Link from "next/link";
+
+import { ClinicCard } from "@/components/booking/ClinicCard";
+import { ClinicSearchForm } from "@/components/booking/ClinicSearchForm";
 import { formatDateUz, formatHHmm } from "@/lib/format";
-import {
-  type DashboardTicket,
-  Department,
-  QueueStatus,
-  Severity,
-  computeExpectedAt,
-} from "@/lib/triage";
+import { MOCK_CLINICS } from "@/lib/mock-data";
+import { ClinicSearchInputSchema } from "@/schemas/booking";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-// -----------------------------------------------------------------------------
-// Seed dataset
-// -----------------------------------------------------------------------------
+export const metadata: Metadata = {
+  title:
+    "Akfa Medline klinikasi onlayn navbat · NavbatCore",
+  description:
+    "Akfa Medline shifoxonalar tarmog'i bo'yicha onlayn navbat oling. Toshkent, Samarqand, Buxoro va boshqa shaharlardagi klinikalar — kardiologiya, stomatologiya, LOR va nevrologiya bo'limlari.",
+  keywords: [
+    "Akfa Medline",
+    "onlayn navbat",
+    "shifoxona Toshkent",
+    "kardiolog navbat",
+    "stomatolog navbat",
+    "LOR shifokori",
+    "nevrolog navbat",
+    "klinika qidirish",
+  ],
+  alternates: { canonical: "/" },
+  openGraph: {
+    type: "website",
+    siteName: "Akfa Medline · NavbatCore",
+    title: "Akfa Medline klinikasi onlayn navbat",
+    description:
+      "Klinikani toping, bo'lim tanlang va onlayn navbat oling. Toshkent vaqtida real navbat.",
+    locale: "uz_UZ",
+  },
+  robots: { index: true, follow: true },
+};
 
-interface Seed {
-  patientFullName: string;
-  patientInitials: string;
-  ticketCode: string;
-  department: Department;
-  severity: Severity;
-  status: QueueStatus;
-  /** How many minutes ago the patient was registered. Drives entryAt. */
-  enteredMinAgo: number;
-  doctorFullName: string;
-  room: string;
+interface PageProps {
+  searchParams?: Record<string, string | string[] | undefined>;
 }
 
-const SEEDS: ReadonlyArray<Seed> = [
-  // ---- Kardiologiya -------------------------------------------------------
-  {
-    patientFullName: "Akmal Karimov",
-    patientInitials: "AK",
-    ticketCode: "K-104",
-    department: Department.KARDIOLOGIYA,
-    severity: Severity.OGIR,
-    status: QueueStatus.QABULDA,
-    enteredMinAgo: 38,
-    doctorFullName: "Dr. Bobur Yo'ldoshev",
-    room: "Xona 207",
-  },
-  {
-    patientFullName: "Dilnoza Rahmonova",
-    patientInitials: "DR",
-    ticketCode: "K-105",
-    department: Department.KARDIOLOGIYA,
-    severity: Severity.ORTA,
-    status: QueueStatus.ROYXATDA,
-    enteredMinAgo: 22,
-    doctorFullName: "Dr. Bobur Yo'ldoshev",
-    room: "Xona 207",
-  },
-  {
-    patientFullName: "Sherzod Tursunov",
-    patientInitials: "ST",
-    ticketCode: "K-106",
-    department: Department.KARDIOLOGIYA,
-    severity: Severity.YENGIL,
-    status: QueueStatus.TASDIQLANGAN,
-    enteredMinAgo: 12,
-    doctorFullName: "Dr. Nigora Saidova",
-    room: "Xona 209",
-  },
-  {
-    patientFullName: "Malika Yusupova",
-    patientInitials: "MY",
-    ticketCode: "K-107",
-    department: Department.KARDIOLOGIYA,
-    severity: Severity.ORTA,
-    status: QueueStatus.KUTMOQDA,
-    enteredMinAgo: 7,
-    doctorFullName: "Dr. Nigora Saidova",
-    room: "Xona 209",
-  },
-  {
-    patientFullName: "Bekzod Aliyev",
-    patientInitials: "BA",
-    ticketCode: "K-108",
-    department: Department.KARDIOLOGIYA,
-    severity: Severity.YENGIL,
-    status: QueueStatus.TUGATILDI,
-    enteredMinAgo: 95,
-    doctorFullName: "Dr. Bobur Yo'ldoshev",
-    room: "Xona 207",
-  },
+export default function HomePage({ searchParams }: PageProps) {
+  // Validate + normalize search params via Zod.
+  const flatten = (v: string | string[] | undefined): string | undefined =>
+    Array.isArray(v) ? v[0] : v;
+  const parsed = ClinicSearchInputSchema.safeParse({
+    q: flatten(searchParams?.q),
+    dep: flatten(searchParams?.dep),
+    city: flatten(searchParams?.city),
+  });
+  const filters = parsed.success ? parsed.data : {};
 
-  // ---- Stomatologiya ------------------------------------------------------
-  {
-    patientFullName: "Nodira Pirmatova",
-    patientInitials: "NP",
-    ticketCode: "S-052",
-    department: Department.STOMATOLOGIYA,
-    severity: Severity.ORTA,
-    status: QueueStatus.QABULDA,
-    enteredMinAgo: 28,
-    doctorFullName: "Dr. Asror Musayev",
-    room: "Xona 112",
-  },
-  {
-    patientFullName: "Jasur Norboyev",
-    patientInitials: "JN",
-    ticketCode: "S-053",
-    department: Department.STOMATOLOGIYA,
-    severity: Severity.YENGIL,
-    status: QueueStatus.ROYXATDA,
-    enteredMinAgo: 18,
-    doctorFullName: "Dr. Asror Musayev",
-    room: "Xona 112",
-  },
-  {
-    patientFullName: "Gulnora Hamidova",
-    patientInitials: "GH",
-    ticketCode: "S-054",
-    department: Department.STOMATOLOGIYA,
-    severity: Severity.OGIR,
-    status: QueueStatus.KUTMOQDA,
-    enteredMinAgo: 15,
-    doctorFullName: "Dr. Lola Abdurahmonova",
-    room: "Xona 114",
-  },
-  {
-    patientFullName: "Rustam Mirzayev",
-    patientInitials: "RM",
-    ticketCode: "S-055",
-    department: Department.STOMATOLOGIYA,
-    severity: Severity.YENGIL,
-    status: QueueStatus.TASDIQLANGAN,
-    enteredMinAgo: 9,
-    doctorFullName: "Dr. Lola Abdurahmonova",
-    room: "Xona 114",
-  },
-  {
-    patientFullName: "Sevara Ibragimova",
-    patientInitials: "SI",
-    ticketCode: "S-056",
-    department: Department.STOMATOLOGIYA,
-    severity: Severity.YENGIL,
-    status: QueueStatus.BEKOR,
-    enteredMinAgo: 67,
-    doctorFullName: "Dr. Asror Musayev",
-    room: "Xona 112",
-  },
+  const cities = Array.from(new Set(MOCK_CLINICS.map((c) => c.city))).sort();
 
-  // ---- LOR ----------------------------------------------------------------
-  {
-    patientFullName: "Ulug'bek Hasanov",
-    patientInitials: "UH",
-    ticketCode: "L-031",
-    department: Department.LOR,
-    severity: Severity.YENGIL,
-    status: QueueStatus.QABULDA,
-    enteredMinAgo: 14,
-    doctorFullName: "Dr. Sanjar Rashidov",
-    room: "Xona 305",
-  },
-  {
-    patientFullName: "Zarina Mirzajonova",
-    patientInitials: "ZM",
-    ticketCode: "L-032",
-    department: Department.LOR,
-    severity: Severity.ORTA,
-    status: QueueStatus.KUTMOQDA,
-    enteredMinAgo: 10,
-    doctorFullName: "Dr. Sanjar Rashidov",
-    room: "Xona 305",
-  },
-  {
-    patientFullName: "Aziz Otaboyev",
-    patientInitials: "AO",
-    ticketCode: "L-033",
-    department: Department.LOR,
-    severity: Severity.YENGIL,
-    status: QueueStatus.TASDIQLANGAN,
-    enteredMinAgo: 5,
-    doctorFullName: "Dr. Madina Yo'ldosheva",
-    room: "Xona 307",
-  },
-  {
-    patientFullName: "Feruza Nazarova",
-    patientInitials: "FN",
-    ticketCode: "L-034",
-    department: Department.LOR,
-    severity: Severity.OGIR,
-    status: QueueStatus.ROYXATDA,
-    enteredMinAgo: 32,
-    doctorFullName: "Dr. Madina Yo'ldosheva",
-    room: "Xona 307",
-  },
-
-  // ---- Nevrologiya --------------------------------------------------------
-  {
-    patientFullName: "Otabek Sodiqov",
-    patientInitials: "OS",
-    ticketCode: "N-088",
-    department: Department.NEVROLOGIYA,
-    severity: Severity.OGIR,
-    status: QueueStatus.QABULDA,
-    enteredMinAgo: 41,
-    doctorFullName: "Dr. Ravshan Qurbonov",
-    room: "Xona 401",
-  },
-  {
-    patientFullName: "Mavluda Eshimova",
-    patientInitials: "ME",
-    ticketCode: "N-089",
-    department: Department.NEVROLOGIYA,
-    severity: Severity.OGIR,
-    status: QueueStatus.ROYXATDA,
-    enteredMinAgo: 26,
-    doctorFullName: "Dr. Ravshan Qurbonov",
-    room: "Xona 401",
-  },
-  {
-    patientFullName: "Sardor Komilov",
-    patientInitials: "SK",
-    ticketCode: "N-090",
-    department: Department.NEVROLOGIYA,
-    severity: Severity.ORTA,
-    status: QueueStatus.TASDIQLANGAN,
-    enteredMinAgo: 13,
-    doctorFullName: "Dr. Kamola Inoyatova",
-    room: "Xona 403",
-  },
-  {
-    patientFullName: "Iroda Tojiboyeva",
-    patientInitials: "IT",
-    ticketCode: "N-091",
-    department: Department.NEVROLOGIYA,
-    severity: Severity.ORTA,
-    status: QueueStatus.KUTMOQDA,
-    enteredMinAgo: 6,
-    doctorFullName: "Dr. Kamola Inoyatova",
-    room: "Xona 403",
-  },
-  {
-    patientFullName: "Anvar Yusufjonov",
-    patientInitials: "AY",
-    ticketCode: "N-092",
-    department: Department.NEVROLOGIYA,
-    severity: Severity.YENGIL,
-    status: QueueStatus.KELMADI,
-    enteredMinAgo: 78,
-    doctorFullName: "Dr. Ravshan Qurbonov",
-    room: "Xona 401",
-  },
-];
-
-const buildTickets = (now: Date): DashboardTicket[] =>
-  SEEDS.map((seed, idx) => {
-    const entryAt = new Date(now.getTime() - seed.enteredMinAgo * 60_000);
-    const expectedAt = computeExpectedAt(entryAt, seed.severity);
-    const initialElapsedSec = Math.max(
-      0,
-      Math.floor((now.getTime() - entryAt.getTime()) / 1000),
-    );
-    return {
-      id: `t_${idx.toString().padStart(3, "0")}`,
-      ticketCode: seed.ticketCode,
-      patientFullName: seed.patientFullName,
-      patientInitials: seed.patientInitials,
-      doctorFullName: seed.doctorFullName,
-      room: seed.room,
-      department: seed.department,
-      severity: seed.severity,
-      status: seed.status,
-      entryAt: entryAt.toISOString(),
-      entryAtFormatted: formatHHmm(entryAt),
-      expectedAt: expectedAt.toISOString(),
-      expectedAtFormatted: formatHHmm(expectedAt),
-      initialElapsedSec,
-    };
+  // Apply filters — order matters for SEO (broadest first).
+  const results = MOCK_CLINICS.filter((c) => {
+    if (filters.dep && !c.departments.includes(filters.dep)) return false;
+    if (filters.city && c.city !== filters.city) return false;
+    if (filters.q) {
+      const needle = filters.q.toLowerCase();
+      const haystack = `${c.displayName} ${c.city} ${c.addressLine}`.toLowerCase();
+      if (!haystack.includes(needle)) return false;
+    }
+    return true;
   });
 
-// -----------------------------------------------------------------------------
-// Page
-// -----------------------------------------------------------------------------
-
-export default function DashboardPage() {
   const now = new Date();
-  const tickets = buildTickets(now);
   const generatedAtFormatted = `${formatDateUz(now)} · ${formatHHmm(now)}`;
 
   return (
     <main className="min-h-dvh bg-slate-50">
       {/* ---------- Top bar ---------- */}
       <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-7xl flex-col gap-4 px-6 py-5 lg:flex-row lg:items-center lg:justify-between lg:py-6">
-          {/* Brand */}
-          <div className="flex items-center gap-4">
+        <div className="mx-auto flex max-w-6xl flex-col gap-4 px-6 py-5 lg:flex-row lg:items-center lg:justify-between lg:py-6">
+          <Link href="/" className="flex items-center gap-3">
             <div
               aria-hidden
               className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-600 text-white shadow-sm"
@@ -321,74 +102,91 @@ export default function DashboardPage() {
               <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-blue-600">
                 Akfa Medline
               </div>
-              <h1 className="text-xl font-semibold tracking-tight text-slate-900">
-                Bosh navbat boshqaruv paneli
-              </h1>
+              <span className="text-base font-semibold text-slate-900">
+                Onlayn navbat tizimi
+              </span>
             </div>
-          </div>
+          </Link>
 
-          {/* Right cluster */}
-          <div className="flex flex-wrap items-center gap-3 text-sm text-slate-600">
-            <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2">
-              <span
-                aria-hidden
-                className="inline-block h-2 w-2 rounded-full bg-emerald-500"
-              />
-              <span className="font-medium">Tizim faol</span>
-            </div>
-            <div className="hidden items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 sm:inline-flex">
+          <div className="flex items-center gap-3 text-sm">
+            <Link
+              href="/dashboard"
+              className="hidden rounded-lg border border-slate-200 bg-white px-3 py-2 font-medium text-slate-700 hover:bg-slate-50 sm:inline-flex"
+            >
+              Xodim paneli
+            </Link>
+            <span className="hidden rounded-lg border border-slate-200 bg-white px-3 py-2 sm:inline-flex">
               <span className="text-xs uppercase tracking-wide text-slate-500">
                 Sana
               </span>
-              <span className="font-mono text-xs text-slate-800">
+              <span className="ml-2 font-mono text-xs text-slate-800">
                 {generatedAtFormatted}
               </span>
-            </div>
-            <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2">
-              <div
-                aria-hidden
-                className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-[10px] font-semibold text-slate-700"
-              >
-                NM
-              </div>
-              <div className="flex flex-col leading-tight">
-                <span className="text-xs font-semibold text-slate-900">
-                  Nilufar Madaminova
-                </span>
-                <span className="text-[11px] text-slate-500">
-                  Bosh navbatchi
-                </span>
-              </div>
-            </div>
+            </span>
           </div>
         </div>
       </header>
 
-      {/* ---------- Content ---------- */}
-      <div className="mx-auto max-w-7xl px-6 py-6 lg:py-8">
-        <div className="mb-6 flex flex-col gap-1">
-          <h2 className="text-2xl font-semibold tracking-tight text-slate-900">
-            Bo'limlar bo'yicha jonli navbat
+      {/* ---------- Hero ---------- */}
+      <section className="border-b border-slate-200 bg-gradient-to-b from-white to-slate-50">
+        <div className="mx-auto max-w-6xl px-6 py-10 lg:py-14">
+          <div className="max-w-3xl">
+            <span className="inline-flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-blue-700 ring-1 ring-inset ring-blue-100">
+              <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-blue-600" />
+              Tarmoq bo'yicha jonli navbat
+            </span>
+            <h1 className="mt-3 text-3xl font-semibold tracking-tight text-slate-900 sm:text-4xl">
+              Akfa Medline klinikasiga onlayn navbat oling
+            </h1>
+            <p className="mt-3 max-w-2xl text-base text-slate-600">
+              Klinikani toping, bo'lim tanlang va saralash algoritmiga ko'ra
+              aniq qabul vaqtini oling — kelishingizdan oldin navbatda kutib
+              o'tirmang.
+            </p>
+          </div>
+
+          <div className="mt-7">
+            <ClinicSearchForm cities={cities} />
+          </div>
+        </div>
+      </section>
+
+      {/* ---------- Results ---------- */}
+      <section className="mx-auto max-w-6xl px-6 py-8">
+        <div className="mb-4 flex items-end justify-between">
+          <h2 className="text-base font-semibold text-slate-900">
+            {results.length === MOCK_CLINICS.length
+              ? "Barcha filiallar"
+              : "Qidiruv natijalari"}
+            <span className="ml-2 font-mono text-sm text-slate-500">
+              ({results.length} ta)
+            </span>
           </h2>
-          <p className="max-w-3xl text-sm text-slate-600">
-            Bemorlar saralash algoritmiga ko'ra taqsimlanadi: yengil holat 15
-            daqiqa, o'rta holat 25 daqiqa, og'ir holat 45 daqiqa. Quyidagi
-            bo'limlardan birini tanlang.
-          </p>
         </div>
 
-        <DashboardShell
-          tickets={tickets}
-          generatedAtFormatted={generatedAtFormatted}
-        />
-      </div>
+        {results.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-slate-200 bg-white p-10 text-center">
+            <h3 className="text-base font-semibold text-slate-900">
+              Hech qanday klinika topilmadi
+            </h3>
+            <p className="mt-1 text-sm text-slate-600">
+              Filtrlarni o'zgartirib qaytadan urinib ko'ring.
+            </p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            {results.map((clinic) => (
+              <ClinicCard key={clinic.id} clinic={clinic} />
+            ))}
+          </div>
+        )}
+      </section>
 
       {/* ---------- Footer ---------- */}
       <footer className="border-t border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-7xl flex-col items-start justify-between gap-2 px-6 py-5 text-xs text-slate-500 sm:flex-row sm:items-center">
+        <div className="mx-auto flex max-w-6xl flex-col items-start justify-between gap-2 px-6 py-5 text-xs text-slate-500 sm:flex-row sm:items-center">
           <div>
-            Akfa Medline shifoxonalar tarmog'i · NavbatCore navbat boshqaruv
-            tizimi
+            Akfa Medline shifoxonalar tarmog'i · NavbatCore navbat boshqaruv tizimi
           </div>
           <div className="font-mono">
             Saralash algoritmi v1.2 · Toshkent vaqti

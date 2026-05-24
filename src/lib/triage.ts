@@ -1,30 +1,43 @@
 /**
- * Triage taxonomy and the Akfa Medline expected-service-time policy.
+ * Triage taxonomy + Akfa Medline service-time policy.
  *
- * One module owns all clinical enums (severity tier, queue status, department)
- * along with their Uzbek-language labels. Every dashboard component, KPI
- * tile, and badge consumes labels from here so the UI is locked to a
- * single localization source.
- *
- * The triage rule is deliberately simple and deterministic — the dashboard
- * never asks an external service for an ETA. It computes:
+ * This module re-exports the canonical `TicketStatus` and `Severity`
+ * enums from `@/schemas/ticket` (the schema-level source of truth),
+ * adds Uzbek-language labels for every enum value, and exposes the
+ * deterministic ETA calculator that drives both the dashboard cells
+ * and the public booking flow.
  *
  *     expectedAt = entryAt + TRIAGE_MINUTES[severity]
  *
- * which means SSR and CSR always produce byte-identical timestamps for the
- * same ticket — a precondition for hydration-safe rendering.
+ * Because the rule is pure arithmetic and timezone-agnostic, server
+ * and client always agree on the timestamp — a hard precondition for
+ * hydration-safe rendering.
  */
 
+import {
+  Severity as TicketSeverity,
+  TicketStatus as TicketStatusEnum,
+  type Severity as SeverityType,
+  type TicketStatus as TicketStatusType,
+} from "@/schemas/ticket";
+
 // -----------------------------------------------------------------------------
-// Severity (Bemor holati)
+// Re-exports — keep the rest of the codebase importing from a single place.
 // -----------------------------------------------------------------------------
 
-export const Severity = {
-  YENGIL: "YENGIL",
-  ORTA: "ORTA",
-  OGIR: "OGIR",
-} as const;
-export type Severity = (typeof Severity)[keyof typeof Severity];
+export const Severity = TicketSeverity;
+export type Severity = SeverityType;
+
+/** Alias kept for legacy call sites; identical to `TicketStatus`. */
+export const QueueStatus = TicketStatusEnum;
+export type QueueStatus = TicketStatusType;
+
+export const TicketStatus = TicketStatusEnum;
+export type TicketStatus = TicketStatusType;
+
+// -----------------------------------------------------------------------------
+// Severity labels + triage matrix
+// -----------------------------------------------------------------------------
 
 export const SEVERITY_LABEL_UZ: Record<Severity, string> = {
   YENGIL: "Yengil",
@@ -32,89 +45,81 @@ export const SEVERITY_LABEL_UZ: Record<Severity, string> = {
   OGIR: "Og'ir",
 };
 
-/** Akfa Medline desk policy, in minutes. Single source of triage truth. */
+export const SEVERITY_DESCRIPTION_UZ: Record<Severity, string> = {
+  YENGIL: "Yengil shikoyat — qisqa muddatli ko'rik",
+  ORTA: "O'rta og'irlikdagi holat — standart konsultatsiya",
+  OGIR: "Og'ir holat — chuqur tekshiruv talab qiladi",
+};
+
+/** Akfa Medline desk policy. Single source of truth for ETA + SLA budget. */
 export const TRIAGE_MINUTES: Record<Severity, number> = {
   YENGIL: 15,
   ORTA: 25,
   OGIR: 45,
 };
 
+export const TRIAGE_BUDGET_SEC: Record<Severity, number> = {
+  YENGIL: 15 * 60,
+  ORTA: 25 * 60,
+  OGIR: 45 * 60,
+};
+
 // -----------------------------------------------------------------------------
 // Queue status (Navbat holati)
 // -----------------------------------------------------------------------------
 
-export const QueueStatus = {
-  KUTMOQDA: "KUTMOQDA",
-  TASDIQLANGAN: "TASDIQLANGAN",
-  ROYXATDA: "ROYXATDA",
-  QABULDA: "QABULDA",
-  TUGATILDI: "TUGATILDI",
-  BEKOR: "BEKOR",
-  KELMADI: "KELMADI",
-} as const;
-export type QueueStatus = (typeof QueueStatus)[keyof typeof QueueStatus];
-
-export const STATUS_LABEL_UZ: Record<QueueStatus, string> = {
+export const STATUS_LABEL_UZ: Record<TicketStatus, string> = {
   KUTMOQDA: "Kutmoqda",
   TASDIQLANGAN: "Tasdiqlangan",
-  ROYXATDA: "Ro'yxatdan o'tgan",
   QABULDA: "Qabulda",
   TUGATILDI: "Tugatildi",
-  BEKOR: "Bekor qilindi",
+  BEKOR_QILINGAN: "Bekor qilingan",
   KELMADI: "Kelmadi",
 };
 
-/** Statuses where the elapsed-time ticker should freeze. */
-export const TERMINAL_STATUSES: ReadonlyArray<QueueStatus> = [
-  QueueStatus.TUGATILDI,
-  QueueStatus.BEKOR,
-  QueueStatus.KELMADI,
+export const TERMINAL_STATUSES: ReadonlyArray<TicketStatus> = [
+  TicketStatus.TUGATILDI,
+  TicketStatus.BEKOR_QILINGAN,
+  TicketStatus.KELMADI,
 ];
 
-export const isTerminalStatus = (s: QueueStatus): boolean =>
+export const isTerminalStatus = (s: TicketStatus): boolean =>
   TERMINAL_STATUSES.includes(s);
 
 // -----------------------------------------------------------------------------
-// Department (Bo'lim)
+// Department (Bo'lim) — UI vocabulary, distinct from the Prisma model name
 // -----------------------------------------------------------------------------
 
-export const Department = {
+export const DepartmentCode = {
   KARDIOLOGIYA: "KARDIOLOGIYA",
   STOMATOLOGIYA: "STOMATOLOGIYA",
   LOR: "LOR",
   NEVROLOGIYA: "NEVROLOGIYA",
 } as const;
-export type Department = (typeof Department)[keyof typeof Department];
+export type DepartmentCode = (typeof DepartmentCode)[keyof typeof DepartmentCode];
 
-export const DEPARTMENT_LABEL_UZ: Record<Department, string> = {
+/** Backwards-compatible alias — older imports use `Department`. */
+export const Department = DepartmentCode;
+export type Department = DepartmentCode;
+
+export const DEPARTMENT_LABEL_UZ: Record<DepartmentCode, string> = {
   KARDIOLOGIYA: "Kardiologiya",
   STOMATOLOGIYA: "Stomatologiya",
   LOR: "LOR",
   NEVROLOGIYA: "Nevrologiya",
 };
 
-/** Render order for the tabs strip. */
-export const DEPARTMENT_ORDER: ReadonlyArray<Department> = [
-  Department.KARDIOLOGIYA,
-  Department.STOMATOLOGIYA,
-  Department.LOR,
-  Department.NEVROLOGIYA,
+export const DEPARTMENT_ORDER: ReadonlyArray<DepartmentCode> = [
+  DepartmentCode.KARDIOLOGIYA,
+  DepartmentCode.STOMATOLOGIYA,
+  DepartmentCode.LOR,
+  DepartmentCode.NEVROLOGIYA,
 ];
 
 // -----------------------------------------------------------------------------
-// View model shipped from server -> client
+// Wire-friendly view model used by the dashboard + tracker
 // -----------------------------------------------------------------------------
 
-/**
- * Wire-friendly ticket row.
- *
- * Every Date is pre-formatted on the server (using a fixed, locale-explicit
- * `Asia/Tashkent` Intl formatter) and shipped as a string so the client
- * never has to compute a clock-derived value during initial render. The
- * only client-side derived field is the elapsed counter, which is seeded
- * from `initialElapsedSec` and ticks via `setInterval` strictly after
- * `useEffect` runs — guaranteeing SSR/CSR text parity at hydration.
- */
 export interface DashboardTicket {
   id: string;
   ticketCode: string;
@@ -123,28 +128,66 @@ export interface DashboardTicket {
   doctorFullName: string;
   room: string;
 
-  department: Department;
+  department: DepartmentCode;
   severity: Severity;
-  status: QueueStatus;
+  status: TicketStatus;
 
-  /** ISO 8601 — kept for downstream analytics; not used for rendering. */
+  /** ISO 8601 — for analytics / WebSocket reconciliation. */
   entryAt: string;
-  /** Formatted "HH:mm" in Asia/Tashkent — rendered as-is. */
+  /** Pre-formatted "HH:mm" in Asia/Tashkent. Hydration-safe. */
   entryAtFormatted: string;
 
-  /** ISO 8601 — kept for downstream analytics; not used for rendering. */
   expectedAt: string;
-  /** Formatted "HH:mm" in Asia/Tashkent — rendered as-is. */
   expectedAtFormatted: string;
 
   /** Whole seconds since `entryAt` at request time. Hydration anchor. */
   initialElapsedSec: number;
+
+  /** True if inserted via the emergency buffer (jumps the queue). */
+  emergency?: boolean;
 }
 
+// -----------------------------------------------------------------------------
+// Triage matrix — public API
+// -----------------------------------------------------------------------------
+
 /**
- * Pure helper used by the page server component when seeding mock data.
- * Lives here so the client can run the same calculation if needed later
- * (e.g. when reconciling a WebSocket update).
+ * Deterministic ETA calculator used by:
+ *   * `/c/[slug]/page.tsx` when a patient picks a severity.
+ *   * The dashboard mock dataset.
+ *   * The retention worker's audit payloads.
+ *
+ * Microsecond-precise: the input `Date` is treated as UTC ms; we just add
+ * the triage budget in milliseconds, so the result is exact to the
+ * platform's `Date` resolution.
  */
 export const computeExpectedAt = (entryAt: Date, severity: Severity): Date =>
   new Date(entryAt.getTime() + TRIAGE_MINUTES[severity] * 60_000);
+
+export interface TriageQuote {
+  severity: Severity;
+  budgetSec: number;
+  budgetMinutesLabel: string;
+  expectedAtIso: string;
+  expectedAtFormatted: string;
+}
+
+/**
+ * Build a triage quote ready to be surfaced on the booking page. The
+ * caller is responsible for the `formatHHmm` helper to keep this module
+ * dependency-free and unit-testable.
+ */
+export const buildTriageQuote = (
+  entryAt: Date,
+  severity: Severity,
+  formatHHmm: (d: Date) => string,
+): TriageQuote => {
+  const expectedAt = computeExpectedAt(entryAt, severity);
+  return {
+    severity,
+    budgetSec: TRIAGE_BUDGET_SEC[severity],
+    budgetMinutesLabel: `${TRIAGE_MINUTES[severity]} daq.`,
+    expectedAtIso: expectedAt.toISOString(),
+    expectedAtFormatted: formatHHmm(expectedAt),
+  };
+};

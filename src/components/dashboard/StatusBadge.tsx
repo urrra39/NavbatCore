@@ -1,27 +1,29 @@
 /**
- * StatusBadge — pill rendering the queue lifecycle state in Uzbek.
+ * StatusBadge — Uzbek queue lifecycle pill.
  *
- * Each status has a distinct neutral / brand-tinted ring color so a
- * receptionist can scan the table at a glance. Terminal states
- * (Tugatildi, Bekor, Kelmadi) deliberately use muted tones so they
- * recede behind the active rows.
+ * Color tokens:
+ *   KUTMOQDA       slate   — neutral, "in line"
+ *   TASDIQLANGAN   blue    — confirmed by reception
+ *   QABULDA        cyan    — currently being seen
+ *   TUGATILDI      emerald — closed, success
+ *   BEKOR_QILINGAN rose    — canceled
+ *   KELMADI        zinc    — no-show, muted
  */
 
 import { cn } from "@/lib/cn";
-import { type QueueStatus, STATUS_LABEL_UZ } from "@/lib/triage";
+import { type TicketStatus, STATUS_LABEL_UZ } from "@/lib/triage";
 
-const STYLE: Record<QueueStatus, string> = {
+const STYLE: Record<TicketStatus, string> = {
   KUTMOQDA: "bg-slate-100 text-slate-700 ring-slate-500/20",
   TASDIQLANGAN: "bg-blue-50 text-blue-700 ring-blue-600/20",
-  ROYXATDA: "bg-indigo-50 text-indigo-700 ring-indigo-600/20",
   QABULDA: "bg-cyan-50 text-cyan-800 ring-cyan-700/30",
   TUGATILDI: "bg-emerald-50 text-emerald-700 ring-emerald-600/20",
-  BEKOR: "bg-rose-50 text-rose-700 ring-rose-600/20",
+  BEKOR_QILINGAN: "bg-rose-50 text-rose-700 ring-rose-600/20",
   KELMADI: "bg-zinc-100 text-zinc-600 ring-zinc-500/20",
 };
 
 interface Props {
-  status: QueueStatus;
+  status: TicketStatus;
   className?: string;
 }
 

@@ -37,6 +37,7 @@ import {
   ArchiveCipher,
   ArchiveCompression,
   TicketStatus,
+  Severity,
 } from "@prisma/client";
 import cron, { type ScheduledTask } from "node-cron";
 
@@ -64,13 +65,14 @@ interface CandidateRow {
   clinic_id: string;
   ticket_code: string;
   status: TicketStatus;
+  severity: Severity;
   channel: string;
   scheduled_for: Date;
   completed_at: Date | null;
   canceled_at: Date | null;
-  service_code: string | null;
+  department_code: string | null;
   duration_sec: number | null;
-  provider_name: string | null;
+  doctor_name: string | null;
 }
 
 interface RunCounters {
@@ -136,21 +138,22 @@ const processBatch = async (
           ht.clinic_id,
           ht.ticket_code,
           ht.status,
+          ht.severity,
           ht.channel::text                AS channel,
           ht.scheduled_for,
           ht.completed_at,
           ht.canceled_at,
-          s.code                          AS service_code,
-          s.duration_sec                  AS duration_sec,
-          p.full_name                     AS provider_name
+          d.code                          AS department_code,
+          d.sla_threshold_sec             AS duration_sec,
+          dr.full_name                    AS doctor_name
         FROM hot_tickets ht
-        LEFT JOIN services  s ON s.id = ht.service_id
-        LEFT JOIN providers p ON p.id = ht.provider_id
+        LEFT JOIN departments d  ON d.id  = ht.department_id
+        LEFT JOIN doctors     dr ON dr.id = ht.doctor_id
         WHERE ht.clinic_id = ${clinicId}
           AND ht.status IN (
-            ${TicketStatus.COMPLETED}::"TicketStatus",
-            ${TicketStatus.CANCELED}::"TicketStatus",
-            ${TicketStatus.NO_SHOW}::"TicketStatus"
+            ${TicketStatus.TUGATILDI}::"TicketStatus",
+            ${TicketStatus.BEKOR_QILINGAN}::"TicketStatus",
+            ${TicketStatus.KELMADI}::"TicketStatus"
           )
           AND COALESCE(ht.completed_at, ht.canceled_at, ht.updated_at) < ${cutoff}
         ORDER BY COALESCE(ht.completed_at, ht.canceled_at, ht.updated_at) ASC
@@ -169,8 +172,8 @@ const processBatch = async (
         tx.hotTicket.findMany({
           where: { id: { in: ticketIds } },
           include: {
-            service: { select: { id: true, code: true, name: true, durationSec: true } },
-            provider: { select: { id: true, fullName: true, specialty: true } },
+            department: { select: { id: true, code: true, name: true, slaThresholdSec: true } },
+            doctor: { select: { id: true, fullName: true, specialty: true } },
             patient: { select: { id: true, fullName: true, locale: true } },
           },
         }),
@@ -218,8 +221,9 @@ const processBatch = async (
             originalTicketId: cand.id,
             ticketCode: cand.ticket_code,
             status: cand.status,
-            serviceCode: cand.service_code,
-            providerName: cand.provider_name,
+            severity: cand.severity,
+            departmentCode: cand.department_code,
+            doctorName: cand.doctor_name,
             scheduledFor: cand.scheduled_for,
             completedAt: cand.completed_at,
             canceledAt: cand.canceled_at,

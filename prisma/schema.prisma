@@ -1,21 +1,24 @@
 // =============================================================================
-// NavbatCore — Multi-Tenant Queue Infrastructure
+// NavbatCore — Multi-Tenant Real-Time Clinic Queue Infrastructure
 // -----------------------------------------------------------------------------
 // Topology
 //   * Shared-database / shared-schema multi-tenancy. Every tenant-owned row
-//     carries a `clinicId` discriminator and every unique constraint is scoped
-//     to that discriminator. The schema is enforced by Postgres FKs *and* by
-//     Zod validators at the application boundary (see src/schemas/*.ts).
+//     carries a `clinicId` discriminator and unique constraints are scoped
+//     to it. Application-layer guarantees come from Zod (see src/schemas).
 //
-//   * Two physical tables back the ticket lifecycle:
-//       - HotTicket          : active, low-latency, narrow indexes, kept slim.
-//       - ColdTicketArchive  : write-mostly, encrypted + gzip-compressed
-//                              snapshot of completed/canceled/no-show tickets
-//                              older than `Clinic.retentionDays` (default 7).
+//   * Three physical tables back the ticket lifecycle:
+//       HotTicket          — active rows, narrow indexes, kept slim.
+//       ColdTicketArchive  — encrypted (AES-256-GCM) + gzipped snapshots
+//                            of terminal tickets older than retentionDays.
+//       AuditLog           — append-only, HMAC-chained immutable ledger.
 //
-//   * All temporal columns use `timestamptz(6)` — microsecond precision is
-//     required for the EMA ETA estimator and for the millisecond countdown
-//     surface rendered by the Liquid Glass UI.
+//   * All temporal columns use `Timestamptz(6)` — microsecond precision
+//     for the dashboard tickers and the smart ETA calculator.
+//
+//   * Status enum is the Uzbek-coded vocabulary (KUTMOQDA, TASDIQLANGAN,
+//     QABULDA, TUGATILDI, BEKOR_QILINGAN, KELMADI). The same identifiers
+//     appear in the Zod schemas (src/schemas/ticket.ts) and the UI labels
+//     (src/lib/triage.ts) — no translation tables, no drift.
 // =============================================================================
 
 generator client {
@@ -42,21 +45,26 @@ enum ClinicPlan {
 }
 
 enum UserRole {
-  OWNER
-  ADMIN
-  RECEPTIONIST
-  PROVIDER
-  PATIENT
+  SUPER_ADMIN     // Cross-tenant operator (Bosh administrator)
+  CLINIC_ADMIN    // Tenant-isolated administrator (Klinika administratori)
+  RECEPTIONIST    // Operational front desk (Qabulchi)
+  DOCTOR          // Read-only personal queue (Shifokor)
+  PATIENT         // Public booking portal user
 }
 
 enum TicketStatus {
-  PENDING       // Created, awaiting confirmation / payment.
-  CONFIRMED     // Locked into the queue.
-  CHECKED_IN    // Patient physically present.
-  IN_PROGRESS   // Currently being served.
-  COMPLETED     // Successfully served — eligible for archival.
-  CANCELED      // Canceled by patient or staff — eligible for archival.
-  NO_SHOW       // Slot expired without check-in — eligible for archival.
+  KUTMOQDA          // Waiting in queue
+  TASDIQLANGAN      // Confirmed by reception
+  QABULDA           // Currently being seen by doctor
+  TUGATILDI         // Completed
+  BEKOR_QILINGAN    // Canceled
+  KELMADI           // No-show
+}
+
+enum Severity {
+  YENGIL    // Light    — 15 min budget
+  ORTA      // Medium   — 25 min budget
+  OGIR      // Severe   — 45 min budget (or more, configurable)
 }
 
 enum TicketChannel {
@@ -64,7 +72,7 @@ enum TicketChannel {
   MOBILE_APP
   WALK_IN
   PHONE
-  PARTNER_API
+  PARTNER_API   // HIS gateway insertions
 }
 
 enum AuditAction {
@@ -73,7 +81,10 @@ enum AuditAction {
   TICKET_RESCHEDULED
   TICKET_ARCHIVED
   TICKET_PURGED
+  EMERGENCY_BUFFER_INSERTED
+  QUEUE_RECALCULATED
   CLINIC_SETTINGS_UPDATED
+  SLA_BREACH_DETECTED
   USER_INVITED
   USER_REVOKED
 }
@@ -106,6 +117,9 @@ model Clinic {
   timezone        String     @default("Asia/Tashkent")
   phone           String?
   email           String?
+  addressLine     String?
+  geoLat          Float?
+  geoLng          Float?
 
   // SEO surface (consumed by Next.js generateMetadata in /c/[slug]).
   metaTitle       String?
@@ -113,32 +127,33 @@ model Clinic {
   ogImageUrl      String?
   keywords        String[]   @default([])
 
-  // Admin-tunable runtime settings. Validated on write via ClinicSettingsSchema.
-  // Shape (see src/schemas/clinic.ts):
-  //   { slotDurationSec, openingHours[], maxQueueDepth, allowOverbook,
-  //     graceWindowSec, emaAlpha, autoCheckInRadiusMeters, ... }
+  // Admin-tunable runtime settings — validated on write via ClinicSettingsSchema.
+  // Shape: {
+  //   slotDurationSec, openingHours[], maxQueueDepth, allowOverbook,
+  //   graceWindowSec, autoCheckInRadiusMeters, sla: { ... }, ...
+  // }
   settings        Json       @default("{}") @db.JsonB
 
-  // Liquid Glass theme tokens (palette, blur radius, gradient stops).
+  // Brand theme tokens (logo, primary blue, accent gray).
   theme           Json       @default("{}") @db.JsonB
 
-  // Retention policy override. The retention worker uses
-  // `min(globalDefault, this)` so tenants can shorten — never extend — defaults.
+  /// Retention policy override. Worker uses min(globalDefault, this).
   retentionDays   Int        @default(7)
 
   isActive        Boolean    @default(true)
   verifiedAt      DateTime?  @db.Timestamptz(6)
 
   createdAt       DateTime   @default(now()) @db.Timestamptz(6)
-  updatedAt       DateTime   @updatedAt @db.Timestamptz(6)
+  updatedAt       DateTime   @updatedAt      @db.Timestamptz(6)
 
   users           User[]
-  services        Service[]
-  providers       Provider[]
-  hotTickets      HotTicket[]
+  departments     Department[]
+  doctors         Doctor[]
+  hotTickets     HotTicket[]
   archives        ColdTicketArchive[]
   auditLogs       AuditLog[]
   retentionRuns   RetentionRun[]
+  slaIncidents    SlaIncident[]
 
   @@index([slug])
   @@index([isActive, plan])
@@ -167,13 +182,11 @@ model User {
   lastSeenAt    DateTime? @db.Timestamptz(6)
 
   createdAt     DateTime  @default(now()) @db.Timestamptz(6)
-  updatedAt     DateTime  @updatedAt @db.Timestamptz(6)
+  updatedAt     DateTime  @updatedAt      @db.Timestamptz(6)
 
   hotTickets    HotTicket[] @relation("PatientTickets")
+  doctorProfile Doctor?     @relation("DoctorUser")
 
-  // A given email/phone is unique per clinic (staff) OR globally (patients,
-  // clinicId NULL). The partial-unique semantics are enforced by raw SQL in
-  // the migration; the composite indexes here cover the lookups.
   @@index([clinicId, email])
   @@index([clinicId, phoneE164])
   @@index([phoneE164])
@@ -182,37 +195,47 @@ model User {
 }
 
 // -----------------------------------------------------------------------------
-// Service & Provider
+// Department & Doctor
 // -----------------------------------------------------------------------------
 
-model Service {
+model Department {
   id              String    @id @default(cuid())
   clinicId        String
   clinic          Clinic    @relation(fields: [clinicId], references: [id], onDelete: Cascade)
 
+  /// Stable code (e.g. "KARDIOLOGIYA") — also used in URLs.
   code            String
   name            String
   description     String?   @db.Text
-  /// Estimated duration in seconds. Used by the EMA ETA model as a prior.
-  durationSec     Int       @default(900)
-  priceMinor      Int       @default(0)
-  currency        String    @default("UZS") @db.VarChar(3)
+
+  /// SLA budget in seconds. Consultations longer than this trigger an alert.
+  /// Defaults follow the triage tier (Yengil 15m / O'rta 25m / Og'ir 45m).
+  slaThresholdSec Int       @default(1500)
+
   isActive        Boolean   @default(true)
 
   createdAt       DateTime  @default(now()) @db.Timestamptz(6)
-  updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt      @db.Timestamptz(6)
 
+  doctors         Doctor[]
   hotTickets      HotTicket[]
 
   @@unique([clinicId, code])
   @@index([clinicId, isActive])
-  @@map("services")
+  @@map("departments")
 }
 
-model Provider {
+model Doctor {
   id              String    @id @default(cuid())
   clinicId        String
   clinic          Clinic    @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  departmentId    String?
+  department      Department? @relation(fields: [departmentId], references: [id])
+
+  /// Optional link to a User row (for login-capable doctors).
+  userId          String?   @unique
+  user            User?     @relation("DoctorUser", fields: [userId], references: [id])
 
   fullName        String
   specialty       String?
@@ -221,27 +244,26 @@ model Provider {
   isActive        Boolean   @default(true)
 
   createdAt       DateTime  @default(now()) @db.Timestamptz(6)
-  updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt      @db.Timestamptz(6)
 
   hotTickets      HotTicket[]
 
+  @@index([clinicId, departmentId, isActive])
   @@index([clinicId, isActive])
-  @@map("providers")
+  @@map("doctors")
 }
 
 // -----------------------------------------------------------------------------
-// HotTicket — the live, hot-path queue row.
+// HotTicket — the live queue row
 // -----------------------------------------------------------------------------
 //
-// Optimistic locking: every state transition increments `version`. The
-// application performs `UPDATE ... WHERE id = $1 AND version = $expected`
-// to prevent double-booking races between WS clients.
-//
-// Indexing strategy:
-//   * (clinicId, status, scheduledFor) — primary queue scan for the live UI.
-//   * (clinicId, ticketCode)           — public lookup by short code.
-//   * (clinicId, status, completedAt)  — feeds the retention worker.
-//   * (patientId, status)              — patient dashboard.
+// Concurrency contract (zero double-booking):
+//   * Every state transition increments `version` and the application
+//     issues `UPDATE ... WHERE id=$1 AND version=$expected`.
+//   * Position-altering operations (emergency buffer insertion, queue
+//     recalculation) MUST run inside a transaction with a per-tenant
+//     advisory lock OR use `SELECT ... FOR UPDATE SKIP LOCKED` — see
+//     the receptionist-action server actions.
 // -----------------------------------------------------------------------------
 
 model HotTicket {
@@ -250,69 +272,73 @@ model HotTicket {
   clinicId         String
   clinic           Clinic        @relation(fields: [clinicId], references: [id], onDelete: Cascade)
 
-  serviceId        String
-  service          Service       @relation(fields: [serviceId], references: [id])
+  departmentId     String
+  department       Department    @relation(fields: [departmentId], references: [id])
 
-  providerId       String?
-  provider         Provider?     @relation(fields: [providerId], references: [id])
+  doctorId         String?
+  doctor           Doctor?       @relation(fields: [doctorId], references: [id])
 
   patientId        String?
   patient          User?         @relation("PatientTickets", fields: [patientId], references: [id])
 
-  // Public, human-friendly short code (e.g. "A-074"). Unique per clinic.
+  /// Public, human-friendly short code (e.g. "K-074"). Unique per clinic.
+  /// Patients track their ticket via /t/{ticketCode} — never via id.
   ticketCode       String
 
-  status           TicketStatus  @default(PENDING)
+  status           TicketStatus  @default(KUTMOQDA)
+  severity         Severity
   channel          TicketChannel @default(WEB)
   priority         Int           @default(0)
 
-  // Deterministic ordering when scheduledFor ties. Uses a 1-based integer
-  // counter scoped per (clinicId, scheduledFor::date).
+  /// True if the ticket was inserted via the receptionist's emergency
+  /// buffer interceptor — used by the worker to expedite analytics.
+  isEmergency      Boolean       @default(false)
+
+  /// Deterministic ordering when scheduledFor ties.
   positionInDay    Int           @default(0)
 
-  // -- Microsecond-precise lifecycle stamps --------------------------------
+  // -- Microsecond-precise lifecycle stamps -------------------------------
   scheduledFor     DateTime      @db.Timestamptz(6)
   enqueuedAt       DateTime      @default(now()) @db.Timestamptz(6)
   confirmedAt      DateTime?     @db.Timestamptz(6)
-  checkedInAt      DateTime?     @db.Timestamptz(6)
   startedAt        DateTime?     @db.Timestamptz(6)
   completedAt      DateTime?     @db.Timestamptz(6)
   canceledAt       DateTime?     @db.Timestamptz(6)
   cancelReason     String?
 
-  // Computed by the EMA estimator on every queue mutation.
+  /// Smart ETA, recomputed after every queue mutation.
   etaAt            DateTime?     @db.Timestamptz(6)
   etaConfidence    Float?
 
-  // Free-form, validated by Zod (TicketMetadataSchema): symptoms, referral,
-  // payment intent, locale, etc. Never trust raw — always parse.
+  /// Free-form, validated by Zod (TicketMetadataSchema).
   metadata         Json          @default("{}") @db.JsonB
 
-  // Optimistic concurrency control.
+  /// Optimistic concurrency control.
   version          Int           @default(0)
 
+  /// Anonymous tracking hash — used by /t/{trackingHash} when patients
+  /// share the link. Distinct from ticketCode so the public URL is hard
+  /// to enumerate.
+  trackingHash     String        @unique @default(cuid())
+
   createdAt        DateTime      @default(now()) @db.Timestamptz(6)
-  updatedAt        DateTime      @updatedAt @db.Timestamptz(6)
+  updatedAt        DateTime      @updatedAt      @db.Timestamptz(6)
+
+  slaIncidents     SlaIncident[]
 
   @@unique([clinicId, ticketCode])
   @@index([clinicId, status, scheduledFor])
+  @@index([clinicId, departmentId, status, scheduledFor])
   @@index([clinicId, status, completedAt])
-  @@index([clinicId, providerId, scheduledFor])
+  @@index([clinicId, doctorId, scheduledFor])
   @@index([patientId, status])
   @@index([etaAt])
+  @@index([isEmergency, scheduledFor])
   @@map("hot_tickets")
 }
 
 // -----------------------------------------------------------------------------
-// ColdTicketArchive — encrypted, compressed, write-once.
-// -----------------------------------------------------------------------------
-//
-// The retention worker (src/workers/retention.worker.ts) copies eligible
-// HotTicket rows here once `completedAt < now() - retentionDays`. The full
-// canonical JSON (including AuditLog tail) is stored in `payloadCipher`,
-// encrypted with AES-256-GCM and compressed with gzip. A small searchable
-// header (clinicId, ticketCode, status, completedAt, scheduledFor) is kept
-// in clear so analytics and patient receipt lookups don't need to decrypt.
+// ColdTicketArchive — encrypted, compressed, write-once
 // -----------------------------------------------------------------------------
 
 model ColdTicketArchive {
@@ -321,42 +347,33 @@ model ColdTicketArchive {
   clinicId         String
   clinic           Clinic             @relation(fields: [clinicId], references: [id], onDelete: Restrict)
 
-  /// The original HotTicket.id at archival time, kept for cross-references.
   originalTicketId String             @unique
 
-  // -- Searchable header (clear) -------------------------------------------
+  // -- Searchable header (clear) ------------------------------------------
   ticketCode       String
   status           TicketStatus
-  serviceCode      String?
-  providerName     String?
+  severity         Severity
+  departmentCode   String?
+  doctorName       String?
   scheduledFor     DateTime           @db.Timestamptz(6)
   completedAt      DateTime?          @db.Timestamptz(6)
   canceledAt       DateTime?          @db.Timestamptz(6)
   channel          TicketChannel
   durationSec      Int?
 
-  // -- Encrypted compressed payload ----------------------------------------
-  /// Raw cipher bytes: ciphertext only (auth tag is separate).
+  // -- Encrypted compressed payload ---------------------------------------
   payloadCipher    Bytes
-  /// 12-byte IV / nonce used by AES-GCM.
   payloadIv        Bytes
-  /// 16-byte GCM authentication tag.
   payloadAuthTag   Bytes
-  /// Additional Authenticated Data — clinicId|ticketCode|keyId — binds the
-  /// ciphertext to its tenant. Tampering across tenants will fail decryption.
   payloadAad       Bytes
   cipher           ArchiveCipher      @default(AES_256_GCM)
   compression      ArchiveCompression @default(GZIP)
 
-  /// Logical key identifier (e.g. "ark-2026-05") for envelope-style rotation.
   keyId            String
-  /// Bytes after JSON.stringify, before compression.
   rawSize          Int
-  /// Bytes after compression, before encryption.
   compressedSize   Int
 
   archivedAt       DateTime           @default(now()) @db.Timestamptz(6)
-  /// Worker-run identifier — links rows back to a RetentionRun batch.
   retentionRunId   String?
   retentionRun     RetentionRun?      @relation(fields: [retentionRunId], references: [id])
 
@@ -368,7 +385,7 @@ model ColdTicketArchive {
 }
 
 // -----------------------------------------------------------------------------
-// RetentionRun — one row per cron tick, used for observability and locking.
+// RetentionRun — observability for the daily archive sweep
 // -----------------------------------------------------------------------------
 
 model RetentionRun {
@@ -388,9 +405,7 @@ model RetentionRun {
   bytesRaw        BigInt    @default(0)
   bytesCompressed BigInt    @default(0)
 
-  /// Worker hostname / pod id — identifies which replica took the lock.
   workerId        String?
-  /// Last error message if the run aborted.
   lastError       String?   @db.Text
 
   archives        ColdTicketArchive[]
@@ -401,31 +416,80 @@ model RetentionRun {
 }
 
 // -----------------------------------------------------------------------------
-// AuditLog — every state transition or settings change.
+// AuditLog — HMAC-chained immutable ledger
+// -----------------------------------------------------------------------------
+//
+// Every record is signed with HMAC-SHA256(secret, prevSignature || payload),
+// forming a hash chain — see src/lib/audit.ts. Tampering with any historical
+// row breaks every signature from that point forward, which the verifier
+// can detect in O(n).
 // -----------------------------------------------------------------------------
 
 model AuditLog {
-  id          String      @id @default(cuid())
+  id            String      @id @default(cuid())
 
-  clinicId    String
-  clinic      Clinic      @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  clinicId      String
+  clinic        Clinic      @relation(fields: [clinicId], references: [id], onDelete: Cascade)
 
-  actorId     String?
-  action      AuditAction
-  /// Polymorphic target ("HotTicket", "ColdTicketArchive", "Clinic", ...).
-  targetType  String
-  targetId    String
+  actorId       String?
+  action        AuditAction
+  targetType    String
+  targetId      String
 
-  /// Rich diff payload validated by AuditPayloadSchema.
-  payload     Json        @default("{}") @db.JsonB
+  payload       Json        @default("{}") @db.JsonB
 
-  ip          String?     @db.Inet
-  userAgent   String?
+  ip            String?     @db.Inet
+  userAgent     String?
 
-  createdAt   DateTime    @default(now()) @db.Timestamptz(6)
+  // -- Cryptographic chain ------------------------------------------------
+  /// Pointer to the previous AuditLog within the same clinicId. NULL for
+  /// the first row of each tenant.
+  previousId    String?
+  /// HMAC-SHA256 over `${previousSignature ?? ""}|${canonicalJson(payload)}`,
+  /// hex-encoded. 64 chars long.
+  signature     String
+
+  createdAt     DateTime    @default(now()) @db.Timestamptz(6)
 
   @@index([clinicId, createdAt])
   @@index([clinicId, targetType, targetId])
   @@index([action, createdAt])
+  @@index([clinicId, previousId])
   @@map("audit_logs")
+}
+
+// -----------------------------------------------------------------------------
+// SlaIncident — one row per SLA breach (consultation overrun)
+// -----------------------------------------------------------------------------
+
+model SlaIncident {
+  id              String     @id @default(cuid())
+
+  clinicId        String
+  clinic          Clinic     @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  hotTicketId     String
+  hotTicket       HotTicket  @relation(fields: [hotTicketId], references: [id], onDelete: Cascade)
+
+  /// Triage budget in seconds at the time of the breach.
+  budgetSec       Int
+  /// Actual duration in seconds when the breach was detected.
+  observedSec     Int
+  /// observedSec - budgetSec, kept denormalized for cheap analytics.
+  overrunSec      Int
+
+  /// Who was working on the ticket when the breach was detected.
+  doctorId        String?
+  doctorName      String?
+
+  /// Set when the incident is reviewed by an admin.
+  resolvedAt      DateTime?  @db.Timestamptz(6)
+  resolutionNote  String?    @db.Text
+
+  detectedAt      DateTime   @default(now()) @db.Timestamptz(6)
+
+  @@index([clinicId, detectedAt])
+  @@index([clinicId, doctorId, detectedAt])
+  @@index([resolvedAt])
+  @@map("sla_incidents")
 }

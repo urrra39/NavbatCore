@@ -1,105 +1,69 @@
 "use client";
 
 /**
- * DashboardShell — the only client-state owner on the page.
+ * DashboardShell — top-level role-routing container.
  *
- * Responsibilities:
- *   * Owns the active-department tab state (`activeDep`).
- *   * Filters the server-supplied ticket dataset client-side — this avoids
- *     a network roundtrip when the user clicks a tab.
- *   * Memoizes the filtered dataset and the per-department counts so
- *     re-renders are O(rows) once, then O(1) per click.
- *
- * No data fetching happens here; the parent (page.tsx) seeds the dataset
- * at request time and ships it down.
+ * Owns the active dashboard role state and renders the matching view.
+ * In production the role is supplied from the authenticated session;
+ * the boilerplate's RoleSwitcher exposes all four personas so reviewers
+ * can walk through the entire RBAC matrix without a login.
  */
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 
-import { DepartmentTable } from "@/components/dashboard/DepartmentTable";
-import { StatsStrip } from "@/components/dashboard/StatsStrip";
-import { cn } from "@/lib/cn";
+import { ClinicAdminView } from "@/components/dashboard/views/ClinicAdminView";
+import { DoctorView } from "@/components/dashboard/views/DoctorView";
+import { ReceptionistView } from "@/components/dashboard/views/ReceptionistView";
+import { SuperAdminView } from "@/components/dashboard/views/SuperAdminView";
 import {
-  type DashboardTicket,
-  type Department,
-  DEPARTMENT_LABEL_UZ,
-  DEPARTMENT_ORDER,
-  Department as DepartmentEnum,
-} from "@/lib/triage";
+  DashboardRole,
+  ROLE_DESCRIPTION_UZ,
+  RoleSwitcher,
+} from "@/components/dashboard/RoleSwitcher";
+import type { DashboardTicket } from "@/lib/triage";
 
 interface Props {
   tickets: ReadonlyArray<DashboardTicket>;
   generatedAtFormatted: string;
+  initialRole?: DashboardRole;
 }
 
-export const DashboardShell = ({ tickets, generatedAtFormatted }: Props) => {
-  const [activeDep, setActiveDep] = useState<Department>(
-    DepartmentEnum.KARDIOLOGIYA,
-  );
-
-  const ticketsForDep = useMemo(
-    () => tickets.filter((t) => t.department === activeDep),
-    [tickets, activeDep],
-  );
-
-  const countByDep = useMemo(() => {
-    const m = new Map<Department, number>();
-    for (const dep of DEPARTMENT_ORDER) m.set(dep, 0);
-    for (const t of tickets) {
-      m.set(t.department, (m.get(t.department) ?? 0) + 1);
-    }
-    return m;
-  }, [tickets]);
+export const DashboardShell = ({
+  tickets,
+  generatedAtFormatted,
+  initialRole = DashboardRole.RECEPTIONIST,
+}: Props) => {
+  const [role, setRole] = useState<DashboardRole>(initialRole);
 
   return (
     <div className="space-y-6">
-      {/* ---------- Department tabs ---------- */}
-      <nav
-        aria-label="Bo'limlar"
-        className="flex w-full items-center gap-1 overflow-x-auto rounded-xl border border-slate-200 bg-white p-1 shadow-sm"
-      >
-        {DEPARTMENT_ORDER.map((dep) => {
-          const isActive = dep === activeDep;
-          const count = countByDep.get(dep) ?? 0;
-          return (
-            <button
-              key={dep}
-              type="button"
-              onClick={() => setActiveDep(dep)}
-              aria-pressed={isActive}
-              className={cn(
-                "flex min-w-[140px] flex-1 items-center justify-between gap-3 rounded-lg px-4 py-2.5 text-sm font-medium transition-colors",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-1",
-                isActive
-                  ? "bg-blue-600 text-white shadow-sm"
-                  : "text-slate-700 hover:bg-slate-50",
-              )}
-            >
-              <span>{DEPARTMENT_LABEL_UZ[dep]}</span>
-              <span
-                className={cn(
-                  "inline-flex h-6 min-w-[1.75rem] items-center justify-center rounded-full px-2 text-xs font-semibold tabular-nums",
-                  isActive
-                    ? "bg-white/20 text-white"
-                    : "bg-slate-100 text-slate-600",
-                )}
-              >
-                {count}
-              </span>
-            </button>
-          );
-        })}
-      </nav>
+      <RoleSwitcher active={role} onChange={setRole} />
 
-      {/* ---------- KPI tiles ---------- */}
-      <StatsStrip
-        tickets={ticketsForDep}
-        department={activeDep}
-        generatedAtFormatted={generatedAtFormatted}
-      />
+      <div className="rounded-xl border border-blue-100 bg-blue-50/50 px-4 py-3 text-xs text-blue-900">
+        <span className="font-semibold">{ROLE_DESCRIPTION_UZ[role]}</span>
+      </div>
 
-      {/* ---------- Data table ---------- */}
-      <DepartmentTable tickets={ticketsForDep} department={activeDep} />
+      {role === DashboardRole.SUPER_ADMIN && (
+        <SuperAdminView generatedAtFormatted={generatedAtFormatted} />
+      )}
+      {role === DashboardRole.CLINIC_ADMIN && (
+        <ClinicAdminView
+          tickets={tickets}
+          generatedAtFormatted={generatedAtFormatted}
+        />
+      )}
+      {role === DashboardRole.RECEPTIONIST && (
+        <ReceptionistView
+          initialTickets={tickets}
+          generatedAtFormatted={generatedAtFormatted}
+        />
+      )}
+      {role === DashboardRole.DOCTOR && (
+        <DoctorView
+          tickets={tickets}
+          generatedAtFormatted={generatedAtFormatted}
+        />
+      )}
     </div>
   );
 };
