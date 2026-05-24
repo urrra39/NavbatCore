@@ -3,27 +3,39 @@
 @tailwind utilities;
 
 /* -------------------------------------------------------------------------- */
-/* NavbatCore — global stage for the Liquid Glass UI                          */
+/* Akfa Medline · clinical light-mode canvas                                  */
 /* -------------------------------------------------------------------------- */
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
+  --nv-canvas: rgb(248 250 252); /* slate-50  */
+  --nv-ink: rgb(15 23 42); /* slate-900 */
+  --nv-rule: rgb(226 232 240); /* slate-200 */
+  --nv-brand: rgb(37 99 235); /* blue-600  */
 }
 
 html,
 body {
-  background:
-    radial-gradient(1200px 800px at 12% -10%, rgba(58, 214, 255, 0.18), transparent 60%),
-    radial-gradient(1000px 700px at 90% 110%, rgba(139, 92, 246, 0.22), transparent 65%),
-    radial-gradient(900px 600px at 50% 50%, rgba(94, 234, 212, 0.10), transparent 70%),
-    #070914;
-  background-attachment: fixed;
-  color: rgb(228 232 240);
-  font-feature-settings: "ss01", "cv11";
+  background: var(--nv-canvas);
+  color: var(--nv-ink);
   min-height: 100dvh;
+  font-feature-settings: "ss01", "cv11";
 }
 
-/* Reduce motion: kill the gradient drift and the connection-pill ping. */
+/* Native form controls in light mode. */
+input,
+textarea,
+select,
+button {
+  color-scheme: light;
+}
+
+/* Tabular numerics for clock columns and KPI tiles. */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Reduce motion: kill long transitions for vestibular comfort. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -32,9 +44,4 @@ body {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
-}
-
-/* Better tabular numerics for the millisecond countdown. */
-.tabular-nums {
-  font-variant-numeric: tabular-nums;
 }

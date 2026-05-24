@@ -1,12 +1,10 @@
 /**
  * Root layout for the Next.js App Router.
  *
- * The layout is a Server Component (no `"use client"`) — it loads the global
- * Tailwind stylesheet, exports the document `<html>` / `<body>` shell, and
- * delegates SEO metadata to `generateMetadata` callers further down the tree
- * (e.g. `/c/[slug]/page.tsx`). Keep this file logic-light: anything that
- * needs hooks, state, or browser APIs belongs in a client component nested
- * deeper in the tree.
+ * Light-mode clinical canvas (Akfa Medline white-label dashboard).
+ * Server Component — only loads global styles, declares the document
+ * shell, and emits SEO + viewport metadata. The interactive dashboard
+ * lives in nested client components.
  */
 
 import type { Metadata, Viewport } from "next";
@@ -16,42 +14,42 @@ import "@/styles/globals.css";
 
 export const metadata: Metadata = {
   title: {
-    default: "NavbatCore — Real-Time Clinic Queue Infrastructure",
+    default: "Akfa Medline · Bosh navbat boshqaruv paneli",
     template: "%s · NavbatCore",
   },
   description:
-    "Multi-tenant, zero-error queue infrastructure for clinics. Millisecond-precise live tickets, Liquid Glass UI, encrypted cold archive.",
+    "Akfa Medline shifoxonalar tarmog'i uchun klinik navbat boshqaruv tizimi. Bo'limlar bo'yicha bemorlar saralash, real vaqt holati nazorati va saralash algoritmi.",
   applicationName: "NavbatCore",
   keywords: [
-    "clinic queue",
-    "navbat",
-    "real-time queue",
-    "appointment infrastructure",
-    "multi-tenant SaaS",
+    "Akfa Medline",
+    "shifoxona navbat",
+    "klinik panel",
+    "saralash algoritmi",
+    "navbat boshqaruvi",
   ],
   authors: [{ name: "NavbatCore" }],
   openGraph: {
-    title: "NavbatCore — Real-Time Clinic Queue Infrastructure",
+    title: "Akfa Medline · Bosh navbat boshqaruv paneli",
     description:
-      "Multi-tenant, zero-error queue infrastructure for clinics with millisecond-precise live tickets.",
+      "Bo'limlar bo'yicha jonli navbat va saralash algoritmi (Yengil 15 daq · O'rta 25 daq · Og'ir 45 daq).",
     type: "website",
-    siteName: "NavbatCore",
+    siteName: "Akfa Medline",
+    locale: "uz_UZ",
   },
-  twitter: { card: "summary_large_image" },
   robots: { index: true, follow: true },
 };
 
 export const viewport: Viewport = {
-  themeColor: "#070914",
-  colorScheme: "dark",
+  themeColor: "#2563eb",
+  colorScheme: "light",
   width: "device-width",
   initialScale: 1,
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <body className="min-h-dvh bg-navbat-ink font-display text-slate-100 antialiased">
+    <html lang="uz" suppressHydrationWarning>
+      <body className="min-h-dvh bg-slate-50 text-slate-900 antialiased">
         {children}
       </body>
     </html>

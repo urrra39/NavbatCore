@@ -1,301 +1,400 @@
 /**
- * Demo landing page.
+ * Akfa Medline · Bosh navbat boshqaruv paneli (Dashboard).
  *
- * This is a Server Component. It builds a realistic, live-looking mock of a
- * patient's flagship "Live Hot Ticket" surface and hands it to the
- * `LiveHotTicketCard` client component, which subscribes to the realtime
- * gateway and animates the millisecond countdown.
+ * Server Component. Responsibilities:
+ *   1. Capture a single request-time anchor (`now`).
+ *   2. Build the mock ticket dataset from a stable seed table and pre-format
+ *      every clock-derived field into a string with the `Asia/Tashkent` Intl
+ *      formatter — this guarantees SSR and CSR produce identical text.
+ *   3. Hand the (already-serializable) dataset down to <DashboardShell/>,
+ *      which is the only client component on the page and which owns the
+ *      department-tab state.
  *
- * Why `force-dynamic`?
- *   The mock `scheduledFor` / `etaAt` values are derived from the current
- *   request time so the countdown always lands a few minutes in the future.
- *   We disable the static cache so every request gets a fresh anchor and
- *   the client never hydrates against a stale ISO string.
- *
- * In production this page would be replaced by `/c/[slug]/page.tsx` (clinic
- * portal, SSR for SEO) and `/t/[code]/page.tsx` (patient ticket, SSR for
- * shareable links). The hero shell and the card layout below are reusable
- * for both.
+ * Hydration policy:
+ *   * No client-side `Date.now()` or `new Date()` runs during the initial
+ *     render. The only ticking value (Sarflangan vaqt) is seeded from a
+ *     server-computed `initialElapsedSec` and starts ticking strictly
+ *     inside `useEffect` — see ElapsedTime.tsx.
+ *   * `dynamic = "force-dynamic"` keeps the cache disabled so every visit
+ *     gets a fresh anchor and the elapsed counters look "live" on first
+ *     load instead of frozen at build time.
  */
 
-import { LiveHotTicketCard } from "@/components/LiveHotTicketCard";
-import { LiquidGlassSurface } from "@/components/glass/LiquidGlassSurface";
-import type { LiveTicketSnapshot } from "@/hooks/useHotTicketSocket";
-import { TicketStatus } from "@/schemas/ticket";
+import { DashboardShell } from "@/components/dashboard/DashboardShell";
+import { formatDateUz, formatHHmm } from "@/lib/format";
+import {
+  type DashboardTicket,
+  Department,
+  QueueStatus,
+  Severity,
+  computeExpectedAt,
+} from "@/lib/triage";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-// ---------------------------------------------------------------------------
-// Mock realtime gateway
-// ---------------------------------------------------------------------------
-//
-// Out of the box the realtime server is not running, so we point at the
-// public env URL (default: http://localhost:4001). The card will gracefully
-// fall back to the "Reconnecting" pill — which is exactly the behaviour we
-// want to demo. The countdown is fully client-side and unaffected.
+// -----------------------------------------------------------------------------
+// Seed dataset
+// -----------------------------------------------------------------------------
 
-const SOCKET_URL = process.env.NEXT_PUBLIC_SOCKET_URL ?? "http://localhost:4001";
-const DEMO_AUTH_TOKEN = "demo.jwt.local-development-only";
+interface Seed {
+  patientFullName: string;
+  patientInitials: string;
+  ticketCode: string;
+  department: Department;
+  severity: Severity;
+  status: QueueStatus;
+  /** How many minutes ago the patient was registered. Drives entryAt. */
+  enteredMinAgo: number;
+  doctorFullName: string;
+  room: string;
+}
 
-// ---------------------------------------------------------------------------
-// Mock clinic / provider context
-// ---------------------------------------------------------------------------
+const SEEDS: ReadonlyArray<Seed> = [
+  // ---- Kardiologiya -------------------------------------------------------
+  {
+    patientFullName: "Akmal Karimov",
+    patientInitials: "AK",
+    ticketCode: "K-104",
+    department: Department.KARDIOLOGIYA,
+    severity: Severity.OGIR,
+    status: QueueStatus.QABULDA,
+    enteredMinAgo: 38,
+    doctorFullName: "Dr. Bobur Yo'ldoshev",
+    room: "Xona 207",
+  },
+  {
+    patientFullName: "Dilnoza Rahmonova",
+    patientInitials: "DR",
+    ticketCode: "K-105",
+    department: Department.KARDIOLOGIYA,
+    severity: Severity.ORTA,
+    status: QueueStatus.ROYXATDA,
+    enteredMinAgo: 22,
+    doctorFullName: "Dr. Bobur Yo'ldoshev",
+    room: "Xona 207",
+  },
+  {
+    patientFullName: "Sherzod Tursunov",
+    patientInitials: "ST",
+    ticketCode: "K-106",
+    department: Department.KARDIOLOGIYA,
+    severity: Severity.YENGIL,
+    status: QueueStatus.TASDIQLANGAN,
+    enteredMinAgo: 12,
+    doctorFullName: "Dr. Nigora Saidova",
+    room: "Xona 209",
+  },
+  {
+    patientFullName: "Malika Yusupova",
+    patientInitials: "MY",
+    ticketCode: "K-107",
+    department: Department.KARDIOLOGIYA,
+    severity: Severity.ORTA,
+    status: QueueStatus.KUTMOQDA,
+    enteredMinAgo: 7,
+    doctorFullName: "Dr. Nigora Saidova",
+    room: "Xona 209",
+  },
+  {
+    patientFullName: "Bekzod Aliyev",
+    patientInitials: "BA",
+    ticketCode: "K-108",
+    department: Department.KARDIOLOGIYA,
+    severity: Severity.YENGIL,
+    status: QueueStatus.TUGATILDI,
+    enteredMinAgo: 95,
+    doctorFullName: "Dr. Bobur Yo'ldoshev",
+    room: "Xona 207",
+  },
 
-const MOCK_CLINIC = {
-  id: "clx0demo000000clinicroot01",
-  slug: "tashkent-cardio-center",
-  displayName: "Tashkent Cardio Center",
-  city: "Tashkent",
-  countryCode: "UZ",
-  // Liquid Glass theme override — cyan x violet, deep frost.
-  theme: { accent: "#3ad6ff", accent2: "#8b5cf6", blur: 48, frost: 0.6 },
-} as const;
+  // ---- Stomatologiya ------------------------------------------------------
+  {
+    patientFullName: "Nodira Pirmatova",
+    patientInitials: "NP",
+    ticketCode: "S-052",
+    department: Department.STOMATOLOGIYA,
+    severity: Severity.ORTA,
+    status: QueueStatus.QABULDA,
+    enteredMinAgo: 28,
+    doctorFullName: "Dr. Asror Musayev",
+    room: "Xona 112",
+  },
+  {
+    patientFullName: "Jasur Norboyev",
+    patientInitials: "JN",
+    ticketCode: "S-053",
+    department: Department.STOMATOLOGIYA,
+    severity: Severity.YENGIL,
+    status: QueueStatus.ROYXATDA,
+    enteredMinAgo: 18,
+    doctorFullName: "Dr. Asror Musayev",
+    room: "Xona 112",
+  },
+  {
+    patientFullName: "Gulnora Hamidova",
+    patientInitials: "GH",
+    ticketCode: "S-054",
+    department: Department.STOMATOLOGIYA,
+    severity: Severity.OGIR,
+    status: QueueStatus.KUTMOQDA,
+    enteredMinAgo: 15,
+    doctorFullName: "Dr. Lola Abdurahmonova",
+    room: "Xona 114",
+  },
+  {
+    patientFullName: "Rustam Mirzayev",
+    patientInitials: "RM",
+    ticketCode: "S-055",
+    department: Department.STOMATOLOGIYA,
+    severity: Severity.YENGIL,
+    status: QueueStatus.TASDIQLANGAN,
+    enteredMinAgo: 9,
+    doctorFullName: "Dr. Lola Abdurahmonova",
+    room: "Xona 114",
+  },
+  {
+    patientFullName: "Sevara Ibragimova",
+    patientInitials: "SI",
+    ticketCode: "S-056",
+    department: Department.STOMATOLOGIYA,
+    severity: Severity.YENGIL,
+    status: QueueStatus.BEKOR,
+    enteredMinAgo: 67,
+    doctorFullName: "Dr. Asror Musayev",
+    room: "Xona 112",
+  },
 
-const MOCK_PROVIDER = {
-  id: "clx0demo000000providerdoc1",
-  fullName: "Dr. Aziza Karimova",
-  specialty: "Pediatric Cardiology",
-  avatarInitials: "AK",
-} as const;
+  // ---- LOR ----------------------------------------------------------------
+  {
+    patientFullName: "Ulug'bek Hasanov",
+    patientInitials: "UH",
+    ticketCode: "L-031",
+    department: Department.LOR,
+    severity: Severity.YENGIL,
+    status: QueueStatus.QABULDA,
+    enteredMinAgo: 14,
+    doctorFullName: "Dr. Sanjar Rashidov",
+    room: "Xona 305",
+  },
+  {
+    patientFullName: "Zarina Mirzajonova",
+    patientInitials: "ZM",
+    ticketCode: "L-032",
+    department: Department.LOR,
+    severity: Severity.ORTA,
+    status: QueueStatus.KUTMOQDA,
+    enteredMinAgo: 10,
+    doctorFullName: "Dr. Sanjar Rashidov",
+    room: "Xona 305",
+  },
+  {
+    patientFullName: "Aziz Otaboyev",
+    patientInitials: "AO",
+    ticketCode: "L-033",
+    department: Department.LOR,
+    severity: Severity.YENGIL,
+    status: QueueStatus.TASDIQLANGAN,
+    enteredMinAgo: 5,
+    doctorFullName: "Dr. Madina Yo'ldosheva",
+    room: "Xona 307",
+  },
+  {
+    patientFullName: "Feruza Nazarova",
+    patientInitials: "FN",
+    ticketCode: "L-034",
+    department: Department.LOR,
+    severity: Severity.OGIR,
+    status: QueueStatus.ROYXATDA,
+    enteredMinAgo: 32,
+    doctorFullName: "Dr. Madina Yo'ldosheva",
+    room: "Xona 307",
+  },
 
-// ---------------------------------------------------------------------------
-// Mock snapshot factory
-// ---------------------------------------------------------------------------
+  // ---- Nevrologiya --------------------------------------------------------
+  {
+    patientFullName: "Otabek Sodiqov",
+    patientInitials: "OS",
+    ticketCode: "N-088",
+    department: Department.NEVROLOGIYA,
+    severity: Severity.OGIR,
+    status: QueueStatus.QABULDA,
+    enteredMinAgo: 41,
+    doctorFullName: "Dr. Ravshan Qurbonov",
+    room: "Xona 401",
+  },
+  {
+    patientFullName: "Mavluda Eshimova",
+    patientInitials: "ME",
+    ticketCode: "N-089",
+    department: Department.NEVROLOGIYA,
+    severity: Severity.OGIR,
+    status: QueueStatus.ROYXATDA,
+    enteredMinAgo: 26,
+    doctorFullName: "Dr. Ravshan Qurbonov",
+    room: "Xona 401",
+  },
+  {
+    patientFullName: "Sardor Komilov",
+    patientInitials: "SK",
+    ticketCode: "N-090",
+    department: Department.NEVROLOGIYA,
+    severity: Severity.ORTA,
+    status: QueueStatus.TASDIQLANGAN,
+    enteredMinAgo: 13,
+    doctorFullName: "Dr. Kamola Inoyatova",
+    room: "Xona 403",
+  },
+  {
+    patientFullName: "Iroda Tojiboyeva",
+    patientInitials: "IT",
+    ticketCode: "N-091",
+    department: Department.NEVROLOGIYA,
+    severity: Severity.ORTA,
+    status: QueueStatus.KUTMOQDA,
+    enteredMinAgo: 6,
+    doctorFullName: "Dr. Kamola Inoyatova",
+    room: "Xona 403",
+  },
+  {
+    patientFullName: "Anvar Yusufjonov",
+    patientInitials: "AY",
+    ticketCode: "N-092",
+    department: Department.NEVROLOGIYA,
+    severity: Severity.YENGIL,
+    status: QueueStatus.KELMADI,
+    enteredMinAgo: 78,
+    doctorFullName: "Dr. Ravshan Qurbonov",
+    room: "Xona 401",
+  },
+];
 
-const buildSnapshot = (
-  overrides: Partial<LiveTicketSnapshot> & Pick<LiveTicketSnapshot, "ticketId" | "ticketCode" | "status" | "positionInDay">,
-): LiveTicketSnapshot => {
-  const now = Date.now();
-  return {
-    clinicId: MOCK_CLINIC.id,
-    scheduledFor: new Date(now + 9 * 60 * 1000).toISOString(),
-    etaAt: new Date(now + 4 * 60 * 1000 + 37_000).toISOString(),
-    etaConfidence: 0.86,
-    lastEventAt: now,
-    ...overrides,
-  };
-};
+const buildTickets = (now: Date): DashboardTicket[] =>
+  SEEDS.map((seed, idx) => {
+    const entryAt = new Date(now.getTime() - seed.enteredMinAgo * 60_000);
+    const expectedAt = computeExpectedAt(entryAt, seed.severity);
+    const initialElapsedSec = Math.max(
+      0,
+      Math.floor((now.getTime() - entryAt.getTime()) / 1000),
+    );
+    return {
+      id: `t_${idx.toString().padStart(3, "0")}`,
+      ticketCode: seed.ticketCode,
+      patientFullName: seed.patientFullName,
+      patientInitials: seed.patientInitials,
+      doctorFullName: seed.doctorFullName,
+      room: seed.room,
+      department: seed.department,
+      severity: seed.severity,
+      status: seed.status,
+      entryAt: entryAt.toISOString(),
+      entryAtFormatted: formatHHmm(entryAt),
+      expectedAt: expectedAt.toISOString(),
+      expectedAtFormatted: formatHHmm(expectedAt),
+      initialElapsedSec,
+    };
+  });
 
-const PRIMARY_SNAPSHOT: LiveTicketSnapshot = buildSnapshot({
-  ticketId: "clx0demo000000ticketprimary1",
-  ticketCode: "A-074",
-  status: TicketStatus.CONFIRMED,
-  positionInDay: 7,
-});
-
-const SECONDARY_SNAPSHOT: LiveTicketSnapshot = buildSnapshot({
-  ticketId: "clx0demo000000ticketnowserv1",
-  ticketCode: "A-073",
-  status: TicketStatus.IN_PROGRESS,
-  positionInDay: 6,
-  // Already started 1m12s ago — countdown will read negative ("Overdue by ...")
-  // which exercises the overflow color path.
-  etaAt: new Date(Date.now() - 72_000).toISOString(),
-  etaConfidence: 0.92,
-});
-
-const TERTIARY_SNAPSHOT: LiveTicketSnapshot = buildSnapshot({
-  ticketId: "clx0demo000000ticketupnext01",
-  ticketCode: "A-075",
-  status: TicketStatus.PENDING,
-  positionInDay: 8,
-  etaAt: new Date(Date.now() + 12 * 60 * 1000 + 5_400).toISOString(),
-  etaConfidence: 0.71,
-});
-
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Page
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
-export default function HomePage() {
+export default function DashboardPage() {
+  const now = new Date();
+  const tickets = buildTickets(now);
+  const generatedAtFormatted = `${formatDateUz(now)} · ${formatHHmm(now)}`;
+
   return (
-    <main className="relative mx-auto flex min-h-dvh w-full max-w-7xl flex-col gap-12 px-6 py-16 sm:px-10 lg:py-24">
-      {/* ---------- Hero ---------- */}
-      <section className="flex flex-col gap-5">
-        <span className="inline-flex w-fit items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-1.5 text-[11px] font-medium uppercase tracking-[0.22em] text-white/70 backdrop-blur-md">
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-300" />
-          Live · {MOCK_CLINIC.displayName}
-        </span>
+    <main className="min-h-dvh bg-slate-50">
+      {/* ---------- Top bar ---------- */}
+      <header className="border-b border-slate-200 bg-white">
+        <div className="mx-auto flex max-w-7xl flex-col gap-4 px-6 py-5 lg:flex-row lg:items-center lg:justify-between lg:py-6">
+          {/* Brand */}
+          <div className="flex items-center gap-4">
+            <div
+              aria-hidden
+              className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-600 text-white shadow-sm"
+            >
+              <span className="text-lg font-bold leading-none">A</span>
+            </div>
+            <div>
+              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-blue-600">
+                Akfa Medline
+              </div>
+              <h1 className="text-xl font-semibold tracking-tight text-slate-900">
+                Bosh navbat boshqaruv paneli
+              </h1>
+            </div>
+          </div>
 
-        <h1 className="max-w-3xl text-balance text-4xl font-semibold leading-[1.05] tracking-tight text-white sm:text-5xl lg:text-6xl">
-          Real-time clinic queue infrastructure with{" "}
-          <span
-            className="bg-gradient-to-r from-cyan-300 via-violet-300 to-fuchsia-300 bg-clip-text text-transparent"
-            style={{ WebkitTextFillColor: "transparent" }}
-          >
-            millisecond precision
-          </span>
-          .
-        </h1>
+          {/* Right cluster */}
+          <div className="flex flex-wrap items-center gap-3 text-sm text-slate-600">
+            <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2">
+              <span
+                aria-hidden
+                className="inline-block h-2 w-2 rounded-full bg-emerald-500"
+              />
+              <span className="font-medium">Tizim faol</span>
+            </div>
+            <div className="hidden items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 sm:inline-flex">
+              <span className="text-xs uppercase tracking-wide text-slate-500">
+                Sana
+              </span>
+              <span className="font-mono text-xs text-slate-800">
+                {generatedAtFormatted}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2">
+              <div
+                aria-hidden
+                className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-[10px] font-semibold text-slate-700"
+              >
+                NM
+              </div>
+              <div className="flex flex-col leading-tight">
+                <span className="text-xs font-semibold text-slate-900">
+                  Nilufar Madaminova
+                </span>
+                <span className="text-[11px] text-slate-500">
+                  Bosh navbatchi
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </header>
 
-        <p className="max-w-2xl text-pretty text-base text-white/70 sm:text-lg">
-          NavbatCore powers multi-tenant clinics with Postgres-backed hot/cold
-          ticket pipelines, an autonomous 7-day retention worker, and a Liquid
-          Glass UI that animates every queue mutation as it happens.
-        </p>
-      </section>
-
-      {/* ---------- Provider context strip ---------- */}
-      <ProviderStrip />
-
-      {/* ---------- Card grid ---------- */}
-      <section className="grid grid-cols-1 gap-8 lg:grid-cols-3">
-        <div className="flex flex-col gap-4">
-          <SectionLabel
-            kicker="Your Ticket"
-            title="In Queue"
-            subtitle="Confirmed · CONFIRMED → CHECKED_IN allowed"
-          />
-          <LiveHotTicketCard
-            socketUrl={SOCKET_URL}
-            authToken={DEMO_AUTH_TOKEN}
-            initialSnapshot={PRIMARY_SNAPSHOT}
-            theme={MOCK_CLINIC.theme}
-          />
+      {/* ---------- Content ---------- */}
+      <div className="mx-auto max-w-7xl px-6 py-6 lg:py-8">
+        <div className="mb-6 flex flex-col gap-1">
+          <h2 className="text-2xl font-semibold tracking-tight text-slate-900">
+            Bo'limlar bo'yicha jonli navbat
+          </h2>
+          <p className="max-w-3xl text-sm text-slate-600">
+            Bemorlar saralash algoritmiga ko'ra taqsimlanadi: yengil holat 15
+            daqiqa, o'rta holat 25 daqiqa, og'ir holat 45 daqiqa. Quyidagi
+            bo'limlardan birini tanlang.
+          </p>
         </div>
 
-        <div className="flex flex-col gap-4">
-          <SectionLabel
-            kicker="Now Serving"
-            title="In Progress"
-            subtitle="Live overdue countdown · IN_PROGRESS"
-          />
-          <LiveHotTicketCard
-            socketUrl={SOCKET_URL}
-            authToken={DEMO_AUTH_TOKEN}
-            initialSnapshot={SECONDARY_SNAPSHOT}
-            theme={{ accent: "#5eead4", accent2: "#3ad6ff", blur: 44, frost: 0.55 }}
-            staffMode
-          />
-        </div>
+        <DashboardShell
+          tickets={tickets}
+          generatedAtFormatted={generatedAtFormatted}
+        />
+      </div>
 
-        <div className="flex flex-col gap-4">
-          <SectionLabel
-            kicker="Up Next"
-            title="Pending"
-            subtitle="Awaiting confirmation · PENDING"
-          />
-          <LiveHotTicketCard
-            socketUrl={SOCKET_URL}
-            authToken={DEMO_AUTH_TOKEN}
-            initialSnapshot={TERTIARY_SNAPSHOT}
-            theme={{ accent: "#ffd166", accent2: "#ff8fa3", blur: 40, frost: 0.5 }}
-          />
+      {/* ---------- Footer ---------- */}
+      <footer className="border-t border-slate-200 bg-white">
+        <div className="mx-auto flex max-w-7xl flex-col items-start justify-between gap-2 px-6 py-5 text-xs text-slate-500 sm:flex-row sm:items-center">
+          <div>
+            Akfa Medline shifoxonalar tarmog'i · NavbatCore navbat boshqaruv
+            tizimi
+          </div>
+          <div className="font-mono">
+            Saralash algoritmi v1.2 · Toshkent vaqti
+          </div>
         </div>
-      </section>
-
-      {/* ---------- Architecture footnote ---------- */}
-      <ArchitectureFootnote />
+      </footer>
     </main>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Sub-sections
-// ---------------------------------------------------------------------------
-
-function ProviderStrip() {
-  return (
-    <LiquidGlassSurface
-      className="px-6 py-5 sm:px-8"
-      accent={["#3ad6ff", "#8b5cf6"]}
-      blur={36}
-      frost={0.45}
-      staticHighlight
-    >
-      <div className="flex flex-col items-start gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-center gap-4">
-          <div className="grid h-12 w-12 place-items-center rounded-2xl border border-white/15 bg-gradient-to-br from-cyan-300/40 to-violet-400/40 font-mono text-sm font-semibold text-white shadow-glass">
-            {MOCK_PROVIDER.avatarInitials}
-          </div>
-          <div className="flex flex-col">
-            <span className="text-base font-semibold text-white">
-              {MOCK_PROVIDER.fullName}
-            </span>
-            <span className="text-xs uppercase tracking-[0.18em] text-white/55">
-              {MOCK_PROVIDER.specialty} · {MOCK_CLINIC.city}, {MOCK_CLINIC.countryCode}
-            </span>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-3 gap-6 text-right sm:gap-10">
-          <Stat label="Queue depth" value="14" />
-          <Stat label="Avg wait" value="8m 24s" />
-          <Stat label="ETA conf." value="0.86" mono />
-        </div>
-      </div>
-    </LiquidGlassSurface>
-  );
-}
-
-function ArchitectureFootnote() {
-  return (
-    <section className="grid grid-cols-1 gap-4 text-sm text-white/65 sm:grid-cols-3">
-      <FootnoteCell
-        title="Multi-Tenant Postgres"
-        body="Shared schema, clinicId-scoped indexes, Timestamptz(6) lifecycle stamps."
-      />
-      <FootnoteCell
-        title="Autonomous Retention"
-        body="node-cron + Redis lock. Tickets older than 7 days are gzipped, AES-256-GCM encrypted, and purged from the hot path."
-      />
-      <FootnoteCell
-        title="Liquid Glass Realtime"
-        body="Redis Pub/Sub → Socket.IO → Framer Motion springs. Every mutation lands on screen within one frame."
-      />
-    </section>
-  );
-}
-
-function SectionLabel({
-  kicker,
-  title,
-  subtitle,
-}: {
-  kicker: string;
-  title: string;
-  subtitle: string;
-}) {
-  return (
-    <div className="flex flex-col gap-1">
-      <span className="text-[10px] font-semibold uppercase tracking-[0.28em] text-white/45">
-        {kicker}
-      </span>
-      <span className="text-lg font-semibold text-white">{title}</span>
-      <span className="font-mono text-[11px] text-white/55">{subtitle}</span>
-    </div>
-  );
-}
-
-function Stat({
-  label,
-  value,
-  mono = false,
-}: {
-  label: string;
-  value: string;
-  mono?: boolean;
-}) {
-  return (
-    <div className="flex flex-col">
-      <span className="text-[10px] uppercase tracking-[0.22em] text-white/45">
-        {label}
-      </span>
-      <span className={mono ? "font-mono text-base text-white" : "text-base font-semibold text-white"}>
-        {value}
-      </span>
-    </div>
-  );
-}
-
-function FootnoteCell({ title, body }: { title: string; body: string }) {
-  return (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-5 backdrop-blur-md">
-      <div className="text-xs font-semibold uppercase tracking-[0.22em] text-white/70">
-        {title}
-      </div>
-      <p className="mt-2 text-sm leading-relaxed text-white/65">{body}</p>
-    </div>
   );
 }
