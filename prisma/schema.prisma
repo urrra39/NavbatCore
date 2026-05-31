@@ -238,10 +238,16 @@ model Provider {
 // to prevent double-booking races between WS clients.
 //
 // Indexing strategy:
-//   * (clinicId, status, scheduledFor) — primary queue scan for the live UI.
-//   * (clinicId, ticketCode)           — public lookup by short code.
-//   * (clinicId, status, completedAt)  — feeds the retention worker.
-//   * (patientId, status)              — patient dashboard.
+//   * (clinicId, status, scheduledFor)            — primary queue scan for the live UI.
+//   * (clinicId, ticketCode)                      — public lookup by short code.
+//   * (clinicId, status, completedAt)             — feeds the retention worker.
+//   * (clinicId, providerId, scheduledFor)        — provider schedule.
+//   * (patientId, status)                         — patient dashboard.
+//   * (clinicId, status, priority, scheduledFor)  — priority-aware queue ordering.
+//   * (clinicId, serviceId, status)               — service-scoped queue view.
+//   * (clinicId, enqueuedAt)                      — FIFO ordering & wait-time analytics.
+//   * (clinicId, scheduledFor)                    — daily schedule view (all statuses).
+//   * (status, scheduledFor)                      — cross-clinic operational monitoring.
 // -----------------------------------------------------------------------------
 
 model HotTicket {
@@ -300,6 +306,28 @@ model HotTicket {
   @@index([clinicId, providerId, scheduledFor])
   @@index([patientId, status])
   @@index([etaAt])
+
+  // Priority-aware queue scan: the live Liquid Glass UI sorts by priority
+  // (descending) then scheduledFor, so the planner can satisfy ORDER BY
+  // directly from the index instead of an in-memory sort.
+  @@index([clinicId, status, priority, scheduledFor])
+
+  // Service-scoped queue view: lets receptionists / providers filter by
+  // a single service without scanning all clinic tickets.
+  @@index([clinicId, serviceId, status])
+
+  // FIFO ordering & wait-time analytics: the EMA ETA estimator and
+  // wait-time histograms query by enqueue order within a clinic.
+  @@index([clinicId, enqueuedAt])
+
+  // Daily schedule view: renders "today's queue" regardless of status,
+  // used by the calendar / day-planner surface.
+  @@index([clinicId, scheduledFor])
+
+  // Cross-clinic operational monitoring: system-wide dashboards that
+  // aggregate active tickets (e.g. "all IN_PROGRESS right now").
+  @@index([status, scheduledFor])
+
   @@map("hot_tickets")
 }
 
